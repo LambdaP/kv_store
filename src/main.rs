@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::env;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -11,7 +13,9 @@ use axum::{
     Router,
 };
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
+
+const DEFAULT_PORT: u16 = 3000;
 
 #[derive(Debug, Default, Clone)]
 struct KvStore(Arc<RwLock<HashMap<String, String>>>);
@@ -46,6 +50,27 @@ impl KvStore {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let port = env::var("KV_STORE_PORT")
+        .map_err(|err| match err {
+            env::VarError::NotPresent => {
+                info!("KV_STORE_PORT environment variable not set. Using default port: {}", DEFAULT_PORT);
+            }
+            env::VarError::NotUnicode(_) => {
+                error!("KV_STORE_PORT environment variable contains invalid UTF-8. Falling back to default port: {}", DEFAULT_PORT);
+            }
+        })
+            .and_then(|port_str| {
+            port_str.parse::<u16>().map_err(|_| {
+                error!("Invalid KV_STORE_PORT value: '{}'. Falling back to default port: {}", port_str, DEFAULT_PORT);
+            })
+        })
+        .inspect(|port| {
+            info!("Successfully read KV_STORE_PORT from environment: {}", port);
+        })
+            .unwrap_or(DEFAULT_PORT);
+
+    let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+
     let kv_store = KvStore::new();
 
     let app = Router::new()
@@ -54,7 +79,7 @@ async fn main() {
         .route("/store/:key", delete(delete_key))
         .with_state(kv_store);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
