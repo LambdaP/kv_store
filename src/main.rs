@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 
@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 const DEFAULT_PORT: u16 = 3000;
 
 #[derive(Debug, Default, Clone)]
-struct KvStore(Arc<RwLock<HashMap<String, String>>>);
+struct KvStore(Arc<RwLock<InnerMap>>);
 
 impl KvStore {
     #[tracing::instrument(level = "trace", skip())]
@@ -27,21 +27,44 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    async fn insert(&mut self, key: String, value: String) -> Option<String> {
+    async fn insert(&mut self, key: String, value: String) {
         debug!("Inserting key: {}", key);
-        self.0.write().await.insert(key, value)
+        self.0.write().await.insert(key, value);
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
     async fn get(&self, key: &str) -> Option<String> {
         debug!("Getting key: {}", key);
-        self.0.read().await.get(key).cloned()
+        self.0.read().await.get(key)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    async fn remove(&mut self, key: &str) -> Option<String> {
+    async fn remove(&mut self, key: &str) -> bool {
         debug!("Removing key: {}", key);
         self.0.write().await.remove(key)
+    }
+}
+
+#[derive(Debug, Default)]
+struct InnerMap(HashMap<String, Mutex<String>>);
+
+impl InnerMap {
+    #[tracing::instrument(level = "trace", skip(self, key, value))]
+    fn insert(&mut self, key: String, value: String) {
+        self.0.insert(key, Mutex::new(value));
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, key))]
+    fn get(&self, key: &str) -> Option<String> {
+        // TODO deal with a poisoned mutex
+        self.0
+            .get(key)
+            .map(|entry| (*entry.lock().unwrap()).clone())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, key))]
+    fn remove(&mut self, key: &str) -> bool {
+        self.0.remove(key).is_some()
     }
 }
 
@@ -111,7 +134,7 @@ async fn delete_key(
     State(mut kv_store): State<KvStore>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    if kv_store.remove(&key).await.is_some() {
+    if kv_store.remove(&key).await {
         info!("Key deleted: {}", key);
         Ok(())
     } else {
