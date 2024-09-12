@@ -66,6 +66,19 @@ impl InnerMap {
     fn remove(&mut self, key: &str) -> bool {
         self.0.remove(key).is_some()
     }
+
+    #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
+    fn compare_and_swap(&mut self, key: &str, expected: &str, new: String) -> Option<bool> {
+        self.0.get(key).map(|locked_entry| {
+            let mut entry = locked_entry.lock().unwrap();
+            if *entry == expected {
+                *entry = new;
+                true
+            } else {
+                false
+            }
+        })
+    }
 }
 
 #[tracing::instrument(level = "trace", skip())]
