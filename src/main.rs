@@ -6,14 +6,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Json, Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
     Router,
 };
 
 use tracing::{debug, error, info};
+
+use serde::Deserialize;
 
 const DEFAULT_PORT: u16 = 3000;
 
@@ -43,6 +45,12 @@ impl KvStore {
         debug!("Removing key: {}", key);
         self.0.write().await.remove(key)
     }
+
+    #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
+    async fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
+        debug!("Compare-and-swap on key: {}", key);
+        self.0.read().await.compare_and_swap(key, expected, new)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -69,7 +77,7 @@ impl InnerMap {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    fn compare_and_swap(&mut self, key: &str, expected: &str, new: String) -> Option<bool> {
+    fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
         self.0.get(key).map(|locked_entry| {
             let mut entry = locked_entry.lock().unwrap();
             if *entry == expected {
@@ -80,6 +88,12 @@ impl InnerMap {
             }
         })
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CasPayload {
+    expected: String,
+    new: String,
 }
 
 #[tracing::instrument(level = "trace", skip())]
@@ -114,6 +128,7 @@ async fn main() {
         .route("/store/:key", get(get_key))
         .route("/store/:key", put(put_key_val))
         .route("/store/:key", delete(delete_key))
+        .route("/store/cas/:key", post(compare_and_swap))
         .with_state(kv_store);
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
@@ -157,6 +172,29 @@ async fn delete_key(
         Ok(StatusCode::NO_CONTENT)
     } else {
         info!("Key not found for deletion: {}", key);
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
+async fn compare_and_swap(
+    State(kv_store): State<KvStore>,
+    Path(key): Path<String>,
+    Json(cas_payload): Json<CasPayload>,
+) -> impl IntoResponse {
+    if let Some(cas_success) = kv_store
+        .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
+        .await
+    {
+        if cas_success {
+            info!("Compare-and-swap on key{}: values match", key);
+            Ok(StatusCode::NO_CONTENT)
+        } else {
+            info!("Compare-and-swap on key{}: values do not match", key);
+            Err(StatusCode::PRECONDITION_FAILED)
+        }
+    } else {
+        info!("Key not found for compare-and-swap: {}", key);
         Err(StatusCode::NOT_FOUND)
     }
 }
