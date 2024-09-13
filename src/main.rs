@@ -27,9 +27,9 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    async fn insert(&mut self, key: String, value: String) {
+    async fn insert(&mut self, key: String, value: String) -> bool {
         debug!("Inserting key: {}", key);
-        self.0.write().await.insert(key, value);
+        self.0.write().await.insert(key, value)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -49,9 +49,10 @@ impl KvStore {
 struct InnerMap(HashMap<String, Mutex<String>>);
 
 impl InnerMap {
+    // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: String, value: String) {
-        self.0.insert(key, Mutex::new(value));
+    fn insert(&mut self, key: String, value: String) -> bool {
+        self.0.insert(key, Mutex::new(value)).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -137,9 +138,13 @@ async fn put_key_val(
     Path(key): Path<String>,
     value: String,
 ) -> impl IntoResponse {
-    kv_store.insert(key, value).await;
-    info!("Key inserted.");
-    StatusCode::OK
+    if kv_store.insert(key, value).await {
+        info!("Key updated");
+        StatusCode::NO_CONTENT
+    } else {
+        info!("Key inserted");
+        StatusCode::CREATED
+    }
 }
 
 #[tracing::instrument(level = "trace", skip(kv_store))]
@@ -149,7 +154,7 @@ async fn delete_key(
 ) -> impl IntoResponse {
     if kv_store.remove(&key).await {
         info!("Key deleted: {}", key);
-        Ok(())
+        Ok(StatusCode::NO_CONTENT)
     } else {
         info!("Key not found for deletion: {}", key);
         Err(StatusCode::NOT_FOUND)
