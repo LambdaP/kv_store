@@ -56,21 +56,21 @@ impl KvStore {
 }
 
 #[derive(Debug, Default)]
-struct InnerMap<K, T>(HashMap<K, Mutex<T>>);
+struct InnerMap<K, V>(HashMap<K, Mutex<V>>);
 
-impl<K, T> InnerMap<K, T>
+impl<K, V> InnerMap<K, V>
 where
     K: Hash + Eq,
-    T: Clone,
+    V: Clone,
 {
     // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: K, value: T) -> bool {
+    fn insert(&mut self, key: K, value: V) -> bool {
         self.0.insert(key, Mutex::new(value)).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    fn get<Q>(&self, key: &Q) -> Option<T>
+    fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -91,12 +91,12 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: T) -> Option<bool>
+    fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Option<bool>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
         E: ?Sized,
-        T: PartialEq<E>,
+        V: PartialEq<E>,
     {
         self.0.get(key).map(|locked_entry| {
             let mut entry = locked_entry.lock().unwrap();
