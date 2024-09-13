@@ -55,6 +55,33 @@ impl KvStore {
     }
 }
 
+// There is an inherent issue
+//   with using a Mutex<V>
+//   as the inner value
+//   (which is required for atomic compare-and-swap).
+// Reading the value
+//   in the get() method
+//   requires holding the lock
+//   while cloning the value,
+//   which possibly takes a long time to complete.
+// A std::sync::Mutex should only be locked
+//   for short periods of time,
+//   because the underlying thread is blocked,
+//   preventing progress on all tasks
+//   that are dispatched to that thread.
+// A possible solution
+//   would be to use a Mutex<Arc<V>>
+//   and return an Arc<V>,
+//   only locking the mutex
+//   while cloning the Arc<V>,
+//   which is fast.
+// As of right now
+//   this shouldn't be a problem
+//   since the inner value cannot be modified,
+//   only overwritten,
+//   thus at worse
+//   the returned pointer no longer points
+//   to the value held in the map.
 #[derive(Debug, Default)]
 struct InnerMap<K, V>(HashMap<K, Mutex<V>>);
 
