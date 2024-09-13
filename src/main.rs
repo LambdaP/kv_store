@@ -20,7 +20,7 @@ use serde::Deserialize;
 const DEFAULT_PORT: u16 = 3000;
 
 #[derive(Debug, Default, Clone)]
-struct KvStore(Arc<RwLock<InnerMap>>);
+struct KvStore(Arc<RwLock<InnerMap<String>>>);
 
 impl KvStore {
     #[tracing::instrument(level = "trace", skip())]
@@ -54,17 +54,20 @@ impl KvStore {
 }
 
 #[derive(Debug, Default)]
-struct InnerMap(HashMap<String, Mutex<String>>);
+struct InnerMap<T>(HashMap<String, Mutex<T>>);
 
-impl InnerMap {
+impl<T> InnerMap<T>
+where
+    T: Clone,
+{
     // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: String, value: String) -> bool {
+    fn insert(&mut self, key: String, value: T) -> bool {
         self.0.insert(key, Mutex::new(value)).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<T> {
         // TODO deal with a poisoned mutex
         self.0
             .get(key)
@@ -77,10 +80,14 @@ impl InnerMap {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
+    fn compare_and_swap<E>(&self, key: &str, expected: &E, new: T) -> Option<bool>
+    where
+        E: ?Sized,
+        T: PartialEq<E>,
+    {
         self.0.get(key).map(|locked_entry| {
             let mut entry = locked_entry.lock().unwrap();
-            if *entry == expected {
+            if *entry == *expected {
                 *entry = new;
                 true
             } else {
