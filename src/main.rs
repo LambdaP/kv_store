@@ -1,5 +1,7 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::env;
+use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +22,7 @@ use serde::Deserialize;
 const DEFAULT_PORT: u16 = 3000;
 
 #[derive(Debug, Default, Clone)]
-struct KvStore(Arc<RwLock<InnerMap<String>>>);
+struct KvStore(Arc<RwLock<InnerMap<String, String>>>);
 
 impl KvStore {
     #[tracing::instrument(level = "trace", skip())]
@@ -54,20 +56,25 @@ impl KvStore {
 }
 
 #[derive(Debug, Default)]
-struct InnerMap<T>(HashMap<String, Mutex<T>>);
+struct InnerMap<K, T>(HashMap<K, Mutex<T>>);
 
-impl<T> InnerMap<T>
+impl<K, T> InnerMap<K, T>
 where
+    K: Hash + Eq,
     T: Clone,
 {
     // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: String, value: T) -> bool {
+    fn insert(&mut self, key: K, value: T) -> bool {
         self.0.insert(key, Mutex::new(value)).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    fn get(&self, key: &str) -> Option<T> {
+    fn get<Q>(&self, key: &Q) -> Option<T>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         // TODO deal with a poisoned mutex
         self.0
             .get(key)
@@ -75,13 +82,19 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    fn remove(&mut self, key: &str) -> bool {
+    fn remove<Q>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.0.remove(key).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    fn compare_and_swap<E>(&self, key: &str, expected: &E, new: T) -> Option<bool>
+    fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: T) -> Option<bool>
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
         E: ?Sized,
         T: PartialEq<E>,
     {
