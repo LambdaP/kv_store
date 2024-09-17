@@ -4,11 +4,12 @@ use std::env;
 use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::{Json, Path, State},
+    extract::{Json, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -30,10 +31,10 @@ impl KvStore {
         KvStore::default()
     }
 
-    #[tracing::instrument(level = "trace", skip(self, key, value))]
-    async fn insert(&mut self, key: String, value: String) -> bool {
+    #[tracing::instrument(level = "trace", skip(self, value))]
+    async fn insert(&mut self, key: String, value: String, ttl: Option<Duration>) -> bool {
         debug!("Inserting key: {}", key);
-        self.0.write().await.insert(key, value)
+        self.0.write().await.insert(key, value, ttl)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -83,7 +84,7 @@ impl KvStore {
 //   the returned pointer no longer points
 //   to the value held in the map.
 #[derive(Debug, Default)]
-struct InnerMap<K, V>(HashMap<K, Mutex<V>>);
+struct InnerMap<K, V>(HashMap<K, Mutex<StoreEntry<V>>>);
 
 impl<K, V> InnerMap<K, V>
 where
@@ -92,8 +93,9 @@ where
 {
     // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: K, value: V) -> bool {
-        self.0.insert(key, Mutex::new(value)).is_some()
+    fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
+        let entry = StoreEntry::new(value, ttl);
+        self.0.insert(key, entry.into()).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -105,7 +107,7 @@ where
         // TODO deal with a poisoned mutex
         self.0
             .get(key)
-            .map(|entry| (*entry.lock().unwrap()).clone())
+            .map(|entry| (entry.lock().unwrap()).value.clone())
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -127,8 +129,8 @@ where
     {
         self.0.get(key).map(|locked_entry| {
             let mut entry = locked_entry.lock().unwrap();
-            if *entry == *expected {
-                *entry = new;
+            if entry.value == *expected {
+                entry.update_value(new);
                 true
             } else {
                 false
@@ -137,10 +139,32 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct StoreEntry<V> {
+    value: V,
+    expires: Option<Instant>,
+}
+
+impl<V> StoreEntry<V> {
+    fn new(value: V, ttl: Option<Duration>) -> Self {
+        let expires = ttl.and_then(|dur| Instant::now().checked_add(dur));
+        StoreEntry { value, expires }
+    }
+
+    fn update_value(&mut self, new: V) {
+        self.value = new;
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct CasPayload {
     expected: String,
     new: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PutRequestQueryParams {
+    ttl: Option<u64>,
 }
 
 #[tracing::instrument(level = "trace", skip())]
@@ -198,9 +222,11 @@ async fn get_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> im
 async fn put_key_val(
     State(mut kv_store): State<KvStore>,
     Path(key): Path<String>,
+    Query(query): Query<PutRequestQueryParams>,
     value: String,
 ) -> impl IntoResponse {
-    if kv_store.insert(key, value).await {
+    let ttl = query.ttl.map(Duration::from_secs);
+    if kv_store.insert(key, value, ttl).await {
         info!("Key updated");
         StatusCode::NO_CONTENT
     } else {
