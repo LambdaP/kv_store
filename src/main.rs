@@ -32,7 +32,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, value))]
-    async fn insert(&mut self, key: String, value: String, ttl: Option<Duration>) -> bool {
+    async fn insert(&self, key: String, value: String, ttl: Option<Duration>) -> bool {
         debug!("Inserting key: {}", key);
         self.0.write().await.insert(key, value, ttl)
     }
@@ -44,7 +44,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    async fn remove(&mut self, key: &str) -> bool {
+    async fn remove(&self, key: &str) -> bool {
         debug!("Removing key: {}", key);
         self.0.write().await.remove(key)
     }
@@ -220,7 +220,7 @@ async fn get_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> im
 
 #[tracing::instrument(level = "trace", skip(kv_store, value))]
 async fn put_key_val(
-    State(mut kv_store): State<KvStore>,
+    State(kv_store): State<KvStore>,
     Path(key): Path<String>,
     Query(query): Query<PutRequestQueryParams>,
     value: String,
@@ -236,10 +236,7 @@ async fn put_key_val(
 }
 
 #[tracing::instrument(level = "trace", skip(kv_store))]
-async fn delete_key(
-    State(mut kv_store): State<KvStore>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
+async fn delete_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> impl IntoResponse {
     if kv_store.remove(&key).await {
         info!("Key deleted: {}", key);
         Ok(StatusCode::NO_CONTENT)
