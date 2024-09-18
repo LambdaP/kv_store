@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use axum::{
     extract::{Json, Path, Query, State},
@@ -22,37 +22,58 @@ use serde::Deserialize;
 
 const DEFAULT_PORT: u16 = 3000;
 
-#[derive(Debug, Default)]
-struct KvStore(RwLock<InnerMap<String, String>>);
+// TODO use a BTreeMap to store keys ordered by expiry date
+#[derive(Debug)]
+struct KvStore {
+    data: RwLock<InnerMap<String, String>>,
+    keys_removal_tx: mpsc::Sender<String>,
+}
 
 impl KvStore {
-    #[tracing::instrument(level = "trace", skip())]
-    fn new() -> KvStore {
-        KvStore::default()
+    #[tracing::instrument(level = "trace", skip(tx))]
+    fn new(tx: mpsc::Sender<String>) -> KvStore {
+        KvStore {
+            data: RwLock::default(),
+            keys_removal_tx: tx,
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(self, value))]
     async fn insert(&self, key: String, value: String, ttl: Option<Duration>) -> bool {
         debug!("Inserting key: {}", key);
-        self.0.write().await.insert(key, value, ttl)
+        self.data.write().await.insert(key, value, ttl)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
     async fn get(&self, key: &str) -> Option<String> {
         debug!("Getting key: {}", key);
-        self.0.read().await.get(key)
+
+        let StoreEntry { value, expires } = self.data.read().await.get(key)?;
+
+        match expires {
+            Some(expires_at) if expires_at < Instant::now() => {
+                self.mark_key_for_removal(key);
+                None
+            }
+            _ => Some(value),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
     async fn remove(&self, key: &str) -> bool {
         debug!("Removing key: {}", key);
-        self.0.write().await.remove(key)
+        self.data.write().await.remove(key)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
     async fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
         debug!("Compare-and-swap on key: {}", key);
-        self.0.read().await.compare_and_swap(key, expected, new)
+        self.data.read().await.compare_and_swap(key, expected, new)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn mark_key_for_removal(&self, key: &str) -> bool {
+        self.keys_removal_tx.try_send(key.into()).is_ok()
     }
 }
 
@@ -99,15 +120,13 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    fn get<Q>(&self, key: &Q) -> Option<V>
+    fn get<Q>(&self, key: &Q) -> Option<StoreEntry<V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         // TODO deal with a poisoned mutex
-        self.0
-            .get(key)
-            .map(|entry| (entry.lock().unwrap()).value.clone())
+        self.0.get(key).map(|entry| (entry.lock().unwrap()).clone())
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
@@ -139,18 +158,20 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct StoreEntry<V> {
     value: V,
     expires: Option<Instant>,
 }
 
 impl<V> StoreEntry<V> {
+    #[tracing::instrument(level = "trace", skip(value, ttl))]
     fn new(value: V, ttl: Option<Duration>) -> Self {
         let expires = ttl.and_then(|dur| Instant::now().checked_add(dur));
         StoreEntry { value, expires }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, new))]
     fn update_value(&mut self, new: V) {
         self.value = new;
     }
@@ -193,7 +214,21 @@ async fn main() {
 
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
 
-    let kv_store = Arc::new(KvStore::new());
+    let (tx, mut rx) = mpsc::channel(64);
+
+    let kv_store = Arc::new(KvStore::new(tx));
+    let cleanup_store = kv_store.clone();
+
+    tokio::spawn(async move {
+        let mut buf = vec![];
+        loop {
+            rx.recv_many(&mut buf, 64).await;
+            let mut store = cleanup_store.data.write().await;
+            buf.drain(..).for_each(|key| {
+                store.remove(&key);
+            });
+        }
+    });
 
     let app = Router::new()
         .route("/store/:key", get(get_key))
