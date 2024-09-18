@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 const DEFAULT_PORT: u16 = 3000;
 
-#[derive(Debug, Default, Clone)]
-struct KvStore(Arc<RwLock<InnerMap<String, String>>>);
+#[derive(Debug, Default)]
+struct KvStore(RwLock<InnerMap<String, String>>);
 
 impl KvStore {
     #[tracing::instrument(level = "trace", skip())]
@@ -193,7 +193,7 @@ async fn main() {
 
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
 
-    let kv_store = KvStore::new();
+    let kv_store = Arc::new(KvStore::new());
 
     let app = Router::new()
         .route("/store/:key", get(get_key))
@@ -207,7 +207,10 @@ async fn main() {
 }
 
 #[tracing::instrument(level = "trace", skip(kv_store))]
-async fn get_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> impl IntoResponse {
+async fn get_key(
+    State(kv_store): State<Arc<KvStore>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
     if let Some(value) = kv_store.get(&key).await {
         info!("Key found: {}", key);
         debug!("Value: {}", value);
@@ -220,7 +223,7 @@ async fn get_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> im
 
 #[tracing::instrument(level = "trace", skip(kv_store, value))]
 async fn put_key_val(
-    State(kv_store): State<KvStore>,
+    State(kv_store): State<Arc<KvStore>>,
     Path(key): Path<String>,
     Query(query): Query<PutRequestQueryParams>,
     value: String,
@@ -236,7 +239,10 @@ async fn put_key_val(
 }
 
 #[tracing::instrument(level = "trace", skip(kv_store))]
-async fn delete_key(State(kv_store): State<KvStore>, Path(key): Path<String>) -> impl IntoResponse {
+async fn delete_key(
+    State(kv_store): State<Arc<KvStore>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
     if kv_store.remove(&key).await {
         info!("Key deleted: {}", key);
         Ok(StatusCode::NO_CONTENT)
@@ -248,7 +254,7 @@ async fn delete_key(State(kv_store): State<KvStore>, Path(key): Path<String>) ->
 
 #[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
 async fn compare_and_swap(
-    State(kv_store): State<KvStore>,
+    State(kv_store): State<Arc<KvStore>>,
     Path(key): Path<String>,
     Json(cas_payload): Json<CasPayload>,
 ) -> impl IntoResponse {
