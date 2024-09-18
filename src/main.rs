@@ -73,7 +73,17 @@ impl KvStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     fn mark_key_for_removal(&self, key: &str) -> bool {
+        info!("Marking key {} for removal", key);
         self.keys_removal_tx.try_send(key.into()).is_ok()
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, rx, buf))]
+    async fn cleanup_received_keys(&self, rx: &mut mpsc::Receiver<String>, buf: &mut Vec<String>) {
+        rx.recv_many(buf, rx.max_capacity()).await;
+        let mut store = self.data.write().await;
+        buf.drain(..).for_each(|key| {
+            _ = store.remove_if_outdated(&key);
+        });
     }
 }
 
@@ -156,6 +166,21 @@ where
             }
         })
     }
+
+    #[tracing::instrument(level = "trace", skip(self, key))]
+    fn remove_if_outdated<Q>(&mut self, key: &Q) -> Option<()>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let expires = { self.0.get(key)?.lock().unwrap().expires? };
+
+        if expires < Instant::now() {
+            self.0.remove(key);
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -222,11 +247,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut buf = vec![];
         loop {
-            rx.recv_many(&mut buf, 64).await;
-            let mut store = cleanup_store.data.write().await;
-            buf.drain(..).for_each(|key| {
-                store.remove(&key);
-            });
+            cleanup_store.cleanup_received_keys(&mut rx, &mut buf).await;
         }
     });
 
