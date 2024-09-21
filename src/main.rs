@@ -3,8 +3,13 @@ use std::collections::HashMap;
 use std::env;
 use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
+
+use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
 
 use tokio::sync::{mpsc, RwLock};
 
@@ -18,14 +23,76 @@ use axum::{
 
 use tracing::{debug, error, info};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_PORT: u16 = 3000;
+
+#[derive(Debug)]
+struct Metrics {
+    start_time: Instant,
+    get_count: AtomicU64,
+    put_count: AtomicU64,
+    delete_count: AtomicU64,
+    cas_success_count: AtomicU64,
+    cas_failure_count: AtomicU64,
+}
+
+impl Default for Metrics {
+    #[tracing::instrument(level = "trace", skip())]
+    fn default() -> Self {
+        Metrics {
+            start_time: Instant::now(),
+            get_count: AtomicU64::default(),
+            put_count: AtomicU64::default(),
+            delete_count: AtomicU64::default(),
+            cas_success_count: AtomicU64::default(),
+            cas_failure_count: AtomicU64::default(),
+        }
+    }
+}
+
+#[tracing::instrument(level = "trace", skip(n))]
+fn increment_au64(n: &AtomicU64) {
+    n.fetch_add(1, Ordering::Relaxed);
+}
+
+impl Metrics {
+    #[tracing::instrument(level = "trace", skip())]
+    fn new() -> Self {
+        Metrics::default()
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn increment_get(&self) {
+        increment_au64(&self.get_count);
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn increment_put(&self) {
+        increment_au64(&self.put_count);
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn increment_delete(&self) {
+        increment_au64(&self.delete_count);
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn increment_cas_success(&self) {
+        increment_au64(&self.cas_success_count);
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn increment_cas_failure(&self) {
+        increment_au64(&self.cas_failure_count);
+    }
+}
 
 // TODO use a BTreeMap to store keys ordered by expiry date
 #[derive(Debug)]
 struct KvStore {
     data: RwLock<InnerMap<String, String>>,
+    metrics: Metrics,
     keys_removal_tx: mpsc::Sender<String>,
 }
 
@@ -34,6 +101,7 @@ impl KvStore {
     fn new(tx: mpsc::Sender<String>) -> KvStore {
         KvStore {
             data: RwLock::default(),
+            metrics: Metrics::new(),
             keys_removal_tx: tx,
         }
     }
@@ -41,12 +109,14 @@ impl KvStore {
     #[tracing::instrument(level = "trace", skip(self, value))]
     async fn insert(&self, key: String, value: String, ttl: Option<Duration>) -> bool {
         debug!("Inserting key: {}", key);
+        self.metrics.increment_put();
         self.data.write().await.insert(key, value, ttl)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
     async fn get(&self, key: &str) -> Option<String> {
         debug!("Getting key: {}", key);
+        self.metrics.increment_get();
 
         let StoreEntry { value, expires } = self.data.read().await.get(key)?;
 
@@ -62,13 +132,22 @@ impl KvStore {
     #[tracing::instrument(level = "trace", skip(self, key))]
     async fn remove(&self, key: &str) -> bool {
         debug!("Removing key: {}", key);
+        self.metrics.increment_delete();
         self.data.write().await.remove(key)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
     async fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
         debug!("Compare-and-swap on key: {}", key);
-        self.data.read().await.compare_and_swap(key, expected, new)
+        let res = self.data.read().await.compare_and_swap(key, expected, new);
+
+        if res == Some(true) {
+            self.metrics.increment_cas_success();
+        } else {
+            self.metrics.increment_cas_failure();
+        }
+
+        res
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -122,6 +201,11 @@ where
     K: Hash + Eq,
     V: Clone,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
     // Returns whether the key was present
     #[tracing::instrument(level = "trace", skip(self, key, value))]
     fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
@@ -213,6 +297,62 @@ struct PutRequestQueryParams {
     ttl: Option<u64>,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct StatusResponse {
+    status: String,
+    uptime: String,
+    total_keys: usize,
+    total_operations: u64,
+    get_operations: u64,
+    put_operations: u64,
+    delete_operations: u64,
+    cas_operations: u64,
+    successful_cas_operations: u64,
+    failed_cas_operations: u64,
+    server_time: String,
+    version: String,
+}
+
+#[tracing::instrument(level = "trace", skip(data, metrics))]
+async fn make_status(KvStore { data, metrics, .. }: &KvStore) -> StatusResponse {
+    let total_keys = { data.read().await.len() };
+
+    let get_operations = metrics.get_count.load(Ordering::Relaxed);
+    let put_operations = metrics.put_count.load(Ordering::Relaxed);
+    let delete_operations = metrics.delete_count.load(Ordering::Relaxed);
+    let successful_cas_operations = metrics.cas_success_count.load(Ordering::Relaxed);
+    let failed_cas_operations = metrics.cas_failure_count.load(Ordering::Relaxed);
+    let cas_operations = successful_cas_operations + failed_cas_operations;
+    let total_operations = get_operations + put_operations + delete_operations + cas_operations;
+
+    let version = env!("CARGO_PKG_VERSION").into();
+
+    let uptime = format!(
+        "{:.3}",
+        Instant::now().signed_duration_since(metrics.start_time)
+    );
+
+    let server_time = OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&Iso8601::DATE_TIME_OFFSET)
+        .unwrap_or_else(|_| "Error formatting server time".into());
+
+    StatusResponse {
+        status: "OK".into(),
+        uptime,
+        total_keys,
+        get_operations,
+        put_operations,
+        delete_operations,
+        successful_cas_operations,
+        failed_cas_operations,
+        cas_operations,
+        total_operations,
+        server_time,
+        version,
+    }
+}
+
 #[tracing::instrument(level = "trace", skip())]
 #[tokio::main]
 async fn main() {
@@ -256,6 +396,7 @@ async fn main() {
         .route("/store/:key", put(put_key_val))
         .route("/store/:key", delete(delete_key))
         .route("/store/cas/:key", post(compare_and_swap))
+        .route("/status", get(status))
         .with_state(kv_store);
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
@@ -329,4 +470,9 @@ async fn compare_and_swap(
         info!("Key not found for compare-and-swap: {}", key);
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+#[tracing::instrument(level = "trace", skip(kv_store))]
+async fn status(State(kv_store): State<Arc<KvStore>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(make_status(&kv_store).await))
 }
