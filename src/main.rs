@@ -14,9 +14,6 @@ use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateT
 use tokio::sync::{mpsc, RwLock};
 
 use axum::{
-    extract::{Json, Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
     routing::{delete, get, post, put},
     Router,
 };
@@ -392,87 +389,98 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/store/:key", get(get_key))
-        .route("/store/:key", put(put_key_val))
-        .route("/store/:key", delete(delete_key))
-        .route("/store/cas/:key", post(compare_and_swap))
-        .route("/status", get(status))
+        .route("/store/:key", get(routes::get_key))
+        .route("/store/:key", put(routes::put_key_val))
+        .route("/store/:key", delete(routes::delete_key))
+        .route("/store/cas/:key", post(routes::compare_and_swap))
+        .route("/status", get(routes::status))
         .with_state(kv_store);
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-#[tracing::instrument(level = "trace", skip(kv_store))]
-async fn get_key(
-    State(kv_store): State<Arc<KvStore>>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
-    if let Some(value) = kv_store.get(&key).await {
-        info!("Key found: {}", key);
-        debug!("Value: {}", value);
-        Ok(value)
-    } else {
-        info!("Key not found: {}", key);
-        Err(StatusCode::NOT_FOUND)
-    }
-}
+mod routes {
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
 
-#[tracing::instrument(level = "trace", skip(kv_store, value))]
-async fn put_key_val(
-    State(kv_store): State<Arc<KvStore>>,
-    Path(key): Path<String>,
-    Query(query): Query<PutRequestQueryParams>,
-    value: String,
-) -> impl IntoResponse {
-    let ttl = query.ttl.map(Duration::from_secs);
-    if kv_store.insert(key, value, ttl).await {
-        info!("Key updated");
-        StatusCode::NO_CONTENT
-    } else {
-        info!("Key inserted");
-        StatusCode::CREATED
-    }
-}
+    use axum::{
+        http::StatusCode,
+        extract::{Json, Path, Query, State},
+        response::IntoResponse,
+    };
 
-#[tracing::instrument(level = "trace", skip(kv_store))]
-async fn delete_key(
-    State(kv_store): State<Arc<KvStore>>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
-    if kv_store.remove(&key).await {
-        info!("Key deleted: {}", key);
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        info!("Key not found for deletion: {}", key);
-        Err(StatusCode::NOT_FOUND)
+    #[tracing::instrument(level = "trace", skip(kv_store))]
+    pub async fn get_key(
+        State(kv_store): State<Arc<KvStore>>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
+        if let Some(value) = kv_store.get(&key).await {
+            info!("Key found: {}", key);
+            debug!("Value: {}", value);
+            Ok(value)
+        } else {
+            info!("Key not found: {}", key);
+            Err(StatusCode::NOT_FOUND)
+        }
     }
-}
 
-#[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
-async fn compare_and_swap(
-    State(kv_store): State<Arc<KvStore>>,
-    Path(key): Path<String>,
-    Json(cas_payload): Json<CasPayload>,
-) -> impl IntoResponse {
-    if let Some(cas_success) = kv_store
-        .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
-        .await
-    {
-        if cas_success {
-            info!("Compare-and-swap on key{}: values match", key);
+    #[tracing::instrument(level = "trace", skip(kv_store, value))]
+    pub async fn put_key_val(
+        State(kv_store): State<Arc<KvStore>>,
+        Path(key): Path<String>,
+        Query(query): Query<PutRequestQueryParams>,
+        value: String,
+    ) -> impl IntoResponse {
+        let ttl = query.ttl.map(Duration::from_secs);
+        if kv_store.insert(key, value, ttl).await {
+            info!("Key updated");
+            StatusCode::NO_CONTENT
+        } else {
+            info!("Key inserted");
+            StatusCode::CREATED
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(kv_store))]
+    pub async fn delete_key(
+        State(kv_store): State<Arc<KvStore>>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
+        if kv_store.remove(&key).await {
+            info!("Key deleted: {}", key);
             Ok(StatusCode::NO_CONTENT)
         } else {
-            info!("Compare-and-swap on key{}: values do not match", key);
-            Err(StatusCode::PRECONDITION_FAILED)
+            info!("Key not found for deletion: {}", key);
+            Err(StatusCode::NOT_FOUND)
         }
-    } else {
-        info!("Key not found for compare-and-swap: {}", key);
-        Err(StatusCode::NOT_FOUND)
     }
-}
 
-#[tracing::instrument(level = "trace", skip(kv_store))]
-async fn status(State(kv_store): State<Arc<KvStore>>) -> impl IntoResponse {
-    (StatusCode::OK, Json(make_status(&kv_store).await))
+    #[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
+    pub async fn compare_and_swap(
+        State(kv_store): State<Arc<KvStore>>,
+        Path(key): Path<String>,
+        Json(cas_payload): Json<CasPayload>,
+    ) -> impl IntoResponse {
+        if let Some(cas_success) = kv_store
+            .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
+            .await
+        {
+            if cas_success {
+                info!("Compare-and-swap on key{}: values match", key);
+                Ok(StatusCode::NO_CONTENT)
+            } else {
+                info!("Compare-and-swap on key{}: values do not match", key);
+                Err(StatusCode::PRECONDITION_FAILED)
+            }
+        } else {
+            info!("Key not found for compare-and-swap: {}", key);
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(kv_store))]
+    pub async fn status(State(kv_store): State<Arc<KvStore>>) -> impl IntoResponse {
+        (StatusCode::OK, Json(make_status(&kv_store).await))
+    }
 }
