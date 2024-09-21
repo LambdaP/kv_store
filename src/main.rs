@@ -9,8 +9,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
-
 use tokio::sync::{mpsc, RwLock};
 
 use axum::{
@@ -19,8 +17,6 @@ use axum::{
 };
 
 use tracing::{debug, error, info};
-
-use serde::{Deserialize, Serialize};
 
 const DEFAULT_PORT: u16 = 3000;
 
@@ -34,20 +30,6 @@ struct Metrics {
     cas_failure_count: AtomicU64,
 }
 
-impl Default for Metrics {
-    #[tracing::instrument(level = "trace", skip())]
-    fn default() -> Self {
-        Metrics {
-            start_time: Instant::now(),
-            get_count: AtomicU64::default(),
-            put_count: AtomicU64::default(),
-            delete_count: AtomicU64::default(),
-            cas_success_count: AtomicU64::default(),
-            cas_failure_count: AtomicU64::default(),
-        }
-    }
-}
-
 #[tracing::instrument(level = "trace", skip(n))]
 fn increment_au64(n: &AtomicU64) {
     n.fetch_add(1, Ordering::Relaxed);
@@ -56,7 +38,14 @@ fn increment_au64(n: &AtomicU64) {
 impl Metrics {
     #[tracing::instrument(level = "trace", skip())]
     fn new() -> Self {
-        Metrics::default()
+        Metrics {
+            start_time: Instant::now(),
+            get_count: AtomicU64::default(),
+            put_count: AtomicU64::default(),
+            delete_count: AtomicU64::default(),
+            cas_success_count: AtomicU64::default(),
+            cas_failure_count: AtomicU64::default(),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -283,73 +272,6 @@ impl<V> StoreEntry<V> {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct CasPayload {
-    expected: String,
-    new: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct PutRequestQueryParams {
-    ttl: Option<u64>,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct StatusResponse {
-    status: String,
-    uptime: String,
-    total_keys: usize,
-    total_operations: u64,
-    get_operations: u64,
-    put_operations: u64,
-    delete_operations: u64,
-    cas_operations: u64,
-    successful_cas_operations: u64,
-    failed_cas_operations: u64,
-    server_time: String,
-    version: String,
-}
-
-#[tracing::instrument(level = "trace", skip(data, metrics))]
-async fn make_status(KvStore { data, metrics, .. }: &KvStore) -> StatusResponse {
-    let total_keys = { data.read().await.len() };
-
-    let get_operations = metrics.get_count.load(Ordering::Relaxed);
-    let put_operations = metrics.put_count.load(Ordering::Relaxed);
-    let delete_operations = metrics.delete_count.load(Ordering::Relaxed);
-    let successful_cas_operations = metrics.cas_success_count.load(Ordering::Relaxed);
-    let failed_cas_operations = metrics.cas_failure_count.load(Ordering::Relaxed);
-    let cas_operations = successful_cas_operations + failed_cas_operations;
-    let total_operations = get_operations + put_operations + delete_operations + cas_operations;
-
-    let version = env!("CARGO_PKG_VERSION").into();
-
-    let uptime = format!(
-        "{:.3}",
-        Instant::now().signed_duration_since(metrics.start_time)
-    );
-
-    let server_time = OffsetDateTime::now_local()
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
-        .format(&Iso8601::DATE_TIME_OFFSET)
-        .unwrap_or_else(|_| "Error formatting server time".into());
-
-    StatusResponse {
-        status: "OK".into(),
-        uptime,
-        total_keys,
-        get_operations,
-        put_operations,
-        delete_operations,
-        successful_cas_operations,
-        failed_cas_operations,
-        cas_operations,
-        total_operations,
-        server_time,
-        version,
-    }
-}
-
 #[tracing::instrument(level = "trace", skip())]
 #[tokio::main]
 async fn main() {
@@ -403,12 +325,41 @@ async fn main() {
 mod routes {
     #[allow(clippy::wildcard_imports)]
     use super::*;
-
     use axum::{
-        http::StatusCode,
         extract::{Json, Path, Query, State},
+        http::StatusCode,
         response::IntoResponse,
     };
+    use serde::{Deserialize, Serialize};
+    use std::time::{Duration, Instant};
+    use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct CasPayload {
+        expected: String,
+        new: String,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct PutRequestQueryParams {
+        ttl: Option<u64>,
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    pub struct StatusResponse {
+        status: String,
+        uptime: String,
+        total_keys: usize,
+        total_operations: u64,
+        get_operations: u64,
+        put_operations: u64,
+        delete_operations: u64,
+        cas_operations: u64,
+        successful_cas_operations: u64,
+        failed_cas_operations: u64,
+        server_time: String,
+        version: String,
+    }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
     pub async fn get_key(
@@ -482,5 +433,45 @@ mod routes {
     #[tracing::instrument(level = "trace", skip(kv_store))]
     pub async fn status(State(kv_store): State<Arc<KvStore>>) -> impl IntoResponse {
         (StatusCode::OK, Json(make_status(&kv_store).await))
+    }
+
+    #[tracing::instrument(level = "trace", skip(data, metrics))]
+    async fn make_status(KvStore { data, metrics, .. }: &KvStore) -> StatusResponse {
+        let total_keys = { data.read().await.len() };
+
+        let get_operations = metrics.get_count.load(Ordering::Relaxed);
+        let put_operations = metrics.put_count.load(Ordering::Relaxed);
+        let delete_operations = metrics.delete_count.load(Ordering::Relaxed);
+        let successful_cas_operations = metrics.cas_success_count.load(Ordering::Relaxed);
+        let failed_cas_operations = metrics.cas_failure_count.load(Ordering::Relaxed);
+        let cas_operations = successful_cas_operations + failed_cas_operations;
+        let total_operations = get_operations + put_operations + delete_operations + cas_operations;
+
+        let version = env!("CARGO_PKG_VERSION").into();
+
+        let uptime = format!(
+            "{:.3}",
+            Instant::now().signed_duration_since(metrics.start_time)
+        );
+
+        let server_time = OffsetDateTime::now_local()
+            .unwrap_or_else(|_| OffsetDateTime::now_utc())
+            .format(&Iso8601::DATE_TIME_OFFSET)
+            .unwrap_or_else(|_| "Error formatting server time".into());
+
+        StatusResponse {
+            status: "OK".into(),
+            uptime,
+            total_keys,
+            get_operations,
+            put_operations,
+            delete_operations,
+            successful_cas_operations,
+            failed_cas_operations,
+            cas_operations,
+            total_operations,
+            server_time,
+            version,
+        }
     }
 }
