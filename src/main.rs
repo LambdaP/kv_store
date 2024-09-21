@@ -1,11 +1,8 @@
-use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::env;
-use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::{Duration, Instant};
 
@@ -77,7 +74,7 @@ impl Metrics {
 // TODO use a BTreeMap to store keys ordered by expiry date
 #[derive(Debug)]
 struct KvStore {
-    data: RwLock<InnerMap<String, String>>,
+    data: RwLock<inner_map::InnerMap<String, String>>,
     metrics: Metrics,
     keys_removal_tx: mpsc::Sender<String>,
 }
@@ -104,7 +101,7 @@ impl KvStore {
         debug!("Getting key: {}", key);
         self.metrics.increment_get();
 
-        let StoreEntry { value, expires } = self.data.read().await.get(key)?;
+        let inner_map::StoreEntry { value, expires } = self.data.read().await.get(key)?;
 
         match expires {
             Some(expires_at) if expires_at < Instant::now() => {
@@ -152,123 +149,131 @@ impl KvStore {
     }
 }
 
-// There is an inherent issue
-//   with using a Mutex<V>
-//   as the inner value
-//   (which is required for atomic compare-and-swap).
-// Reading the value
-//   in the get() method
-//   requires holding the lock
-//   while cloning the value,
-//   which possibly takes a long time to complete.
-// A std::sync::Mutex should only be locked
-//   for short periods of time,
-//   because the underlying thread is blocked,
-//   preventing progress on all tasks
-//   that are dispatched to that thread.
-// A possible solution
-//   would be to use a Mutex<Arc<V>>
-//   and return an Arc<V>,
-//   only locking the mutex
-//   while cloning the Arc<V>,
-//   which is fast.
-// As of right now
-//   this shouldn't be a problem
-//   since the inner value cannot be modified,
-//   only overwritten,
-//   thus at worse
-//   the returned pointer no longer points
-//   to the value held in the map.
-#[derive(Debug, Default)]
-struct InnerMap<K, V>(HashMap<K, Mutex<StoreEntry<V>>>);
+mod inner_map {
+    use std::borrow::Borrow;
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
-impl<K, V> InnerMap<K, V>
-where
-    K: Hash + Eq,
-    V: Clone,
-{
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn len(&self) -> usize {
-        self.0.len()
+    #[derive(Debug, Default, Clone)]
+    pub struct StoreEntry<V> {
+        pub value: V,
+        pub expires: Option<Instant>,
     }
 
-    // Returns whether the key was present
-    #[tracing::instrument(level = "trace", skip(self, key, value))]
-    fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
-        let entry = StoreEntry::new(value, ttl);
-        self.0.insert(key, entry.into()).is_some()
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, key))]
-    fn get<Q>(&self, key: &Q) -> Option<StoreEntry<V>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        // TODO deal with a poisoned mutex
-        self.0.get(key).map(|entry| (entry.lock().unwrap()).clone())
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, key))]
-    fn remove<Q>(&mut self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.0.remove(key).is_some()
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Option<bool>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-        E: ?Sized,
-        V: PartialEq<E>,
-    {
-        self.0.get(key).map(|locked_entry| {
-            let mut entry = locked_entry.lock().unwrap();
-            if entry.value == *expected {
-                entry.update_value(new);
-                true
-            } else {
-                false
-            }
-        })
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, key))]
-    fn remove_if_outdated<Q>(&mut self, key: &Q) -> Option<()>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let expires = { self.0.get(key)?.lock().unwrap().expires? };
-
-        if expires < Instant::now() {
-            self.0.remove(key);
+    impl<V> StoreEntry<V> {
+        #[tracing::instrument(level = "trace", skip(value, ttl))]
+        fn new(value: V, ttl: Option<Duration>) -> Self {
+            let expires = ttl.and_then(|dur| Instant::now().checked_add(dur));
+            StoreEntry { value, expires }
         }
 
-        None
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct StoreEntry<V> {
-    value: V,
-    expires: Option<Instant>,
-}
-
-impl<V> StoreEntry<V> {
-    #[tracing::instrument(level = "trace", skip(value, ttl))]
-    fn new(value: V, ttl: Option<Duration>) -> Self {
-        let expires = ttl.and_then(|dur| Instant::now().checked_add(dur));
-        StoreEntry { value, expires }
+        #[tracing::instrument(level = "trace", skip(self, new))]
+        fn update_value(&mut self, new: V) {
+            self.value = new;
+        }
     }
 
-    #[tracing::instrument(level = "trace", skip(self, new))]
-    fn update_value(&mut self, new: V) {
-        self.value = new;
+    // There is an inherent issue
+    //   with using a Mutex<V>
+    //   as the inner value
+    //   (which is required for atomic compare-and-swap).
+    // Reading the value
+    //   in the get() method
+    //   requires holding the lock
+    //   while cloning the value,
+    //   which possibly takes a long time to complete.
+    // A std::sync::Mutex should only be locked
+    //   for short periods of time,
+    //   because the underlying thread is blocked,
+    //   preventing progress on all tasks
+    //   that are dispatched to that thread.
+    // A possible solution
+    //   would be to use a Mutex<Arc<V>>
+    //   and return an Arc<V>,
+    //   only locking the mutex
+    //   while cloning the Arc<V>,
+    //   which is fast.
+    // As of right now
+    //   this shouldn't be a problem
+    //   since the inner value cannot be modified,
+    //   only overwritten,
+    //   thus at worse
+    //   the returned pointer no longer points
+    //   to the value held in the map.
+    #[derive(Debug, Default)]
+    pub struct InnerMap<K, V>(HashMap<K, Mutex<StoreEntry<V>>>);
+
+    impl<K, V> InnerMap<K, V>
+    where
+        K: Hash + Eq,
+        V: Clone,
+    {
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        // Returns whether the key was present
+        #[tracing::instrument(level = "trace", skip(self, key, value))]
+        pub fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
+            let entry = StoreEntry::new(value, ttl);
+            self.0.insert(key, entry.into()).is_some()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key))]
+        pub fn get<Q>(&self, key: &Q) -> Option<StoreEntry<V>>
+        where
+            K: Borrow<Q>,
+            Q: Hash + Eq + ?Sized,
+        {
+            // TODO deal with a poisoned mutex
+            self.0.get(key).map(|entry| (entry.lock().unwrap()).clone())
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key))]
+        pub fn remove<Q>(&mut self, key: &Q) -> bool
+        where
+            K: Borrow<Q>,
+            Q: Hash + Eq + ?Sized,
+        {
+            self.0.remove(key).is_some()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
+        pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Option<bool>
+        where
+            K: Borrow<Q>,
+            Q: Hash + Eq + ?Sized,
+            E: ?Sized,
+            V: PartialEq<E>,
+        {
+            self.0.get(key).map(|locked_entry| {
+                let mut entry = locked_entry.lock().unwrap();
+                if entry.value == *expected {
+                    entry.update_value(new);
+                    true
+                } else {
+                    false
+                }
+            })
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key))]
+        pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> Option<()>
+        where
+            K: Borrow<Q>,
+            Q: Hash + Eq + ?Sized,
+        {
+            let expires = { self.0.get(key)?.lock().unwrap().expires? };
+
+            if expires < Instant::now() {
+                self.0.remove(key);
+            }
+
+            None
+        }
     }
 }
 
