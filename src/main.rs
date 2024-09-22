@@ -13,9 +13,12 @@ use axum::{
     Router,
 };
 
+use tower_governor::{governor::GovernorConfig, GovernorLayer};
+
 use tracing::{debug, error, info};
 
 const DEFAULT_PORT: u16 = 3000;
+const MAX_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 struct Metrics {
@@ -315,6 +318,8 @@ async fn main() {
         }
     });
 
+    let governor_config = Arc::new(GovernorConfig::default());
+
     let app = Router::new()
         .route("/store/:key", get(routes::get_key))
         .route("/store/:key", put(routes::put_key_val))
@@ -322,6 +327,9 @@ async fn main() {
         .route("/store/cas/:key", post(routes::compare_and_swap))
         .route("/batch", post(routes::batch_process))
         .route("/status", get(routes::status))
+        .layer(GovernorLayer {
+            config: governor_config,
+        })
         .with_state(kv_store);
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
@@ -469,6 +477,10 @@ mod routes {
         State(kv_store): State<Arc<KvStore>>,
         Json(requests): Json<Vec<SimpleRequest>>,
     ) -> impl IntoResponse {
+        if requests.len() > MAX_BATCH_SIZE {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
         let handles = requests.into_iter().map(|request| {
             let kv_store = kv_store.clone();
             match request {
@@ -511,7 +523,7 @@ mod routes {
             });
         }
 
-        Json(responses)
+        Ok(Json(responses))
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
