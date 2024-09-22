@@ -320,6 +320,7 @@ async fn main() {
         .route("/store/:key", put(routes::put_key_val))
         .route("/store/:key", delete(routes::delete_key))
         .route("/store/cas/:key", post(routes::compare_and_swap))
+        .route("/batch", post(routes::batch_process))
         .route("/status", get(routes::status))
         .with_state(kv_store);
 
@@ -364,6 +365,31 @@ mod routes {
         failed_cas_operations: u64,
         server_time: String,
         version: String,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(tag = "method")]
+    #[serde(rename_all = "UPPERCASE")]
+    pub enum SimpleRequest {
+        Get {
+            key: String,
+        },
+        Put {
+            key: String,
+            value: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl: Option<u64>,
+        },
+        Delete {
+            key: String,
+        },
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct SimpleResponse {
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
@@ -433,6 +459,59 @@ mod routes {
             info!("Key not found for compare-and-swap: {}", key);
             Err(StatusCode::NOT_FOUND)
         }
+    }
+
+    // TODO this duplicates API logic with other route handlers (get_key etc.)
+    //   obviously this is outrageous
+    //   and I should do something better
+    #[tracing::instrument(level = "trace", skip(kv_store, requests))]
+    pub async fn batch_process(
+        State(kv_store): State<Arc<KvStore>>,
+        Json(requests): Json<Vec<SimpleRequest>>,
+    ) -> impl IntoResponse {
+        let handles = requests.into_iter().map(|request| {
+            let kv_store = kv_store.clone();
+            match request {
+                SimpleRequest::Get { key } => tokio::task::spawn(async move {
+                    if let Some(value) = kv_store.get(&key).await {
+                        (StatusCode::OK, Some(value))
+                    } else {
+                        (StatusCode::NOT_FOUND, None)
+                    }
+                }),
+                SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
+                    let ttl = ttl.map(Duration::from_secs);
+                    let status = if kv_store.insert(key, value, ttl).await {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::CREATED
+                    };
+                    (status, None)
+                }),
+                SimpleRequest::Delete { key } => tokio::task::spawn(async move {
+                    let status = if kv_store.remove(&key).await {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    (status, None)
+                }),
+            }
+        });
+
+        let mut responses = vec![];
+
+        for handle in handles {
+            let (status, value) = handle
+                .await
+                .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, None));
+            responses.push(SimpleResponse {
+                status: status.as_u16(),
+                value,
+            });
+        }
+
+        Json(responses)
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
