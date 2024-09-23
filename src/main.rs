@@ -378,6 +378,30 @@ mod store_interface {
         }
 
         #[tokio::test]
+        async fn test_metrics_accuracy() {
+            let (tx, _rx) = mpsc::channel(64);
+            let store = Arc::new(KvStore::new(tx));
+
+            // Perform a series of operations
+            store
+                .insert("key1".to_string(), Bytes::from("value1"), None)
+                .await;
+            store.get("key1").await;
+            store.get("non_existent").await;
+            store.remove("key1").await;
+            store
+                .compare_and_swap("key2", b"old", Bytes::from("new"))
+                .await;
+
+            // Check metrics
+            assert_eq!(store.metrics.total_put_ops(), 1);
+            assert_eq!(store.metrics.total_get_ops(), 2);
+            assert_eq!(store.metrics.total_delete_ops(), 1);
+            assert_eq!(store.metrics.total_cas_failure(), 1);
+            assert_eq!(store.metrics.total_cas_success(), 0);
+        }
+
+        #[tokio::test]
         async fn test_cleanup_received_keys() {
             let (tx, mut rx) = mpsc::channel(64);
             let store = Arc::new(KvStore::new(tx));
@@ -1015,7 +1039,9 @@ mod routes {
             let response = app.oneshot(get_request).await.unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             assert_eq!(&body[..], b"test_value");
         }
 
@@ -1104,7 +1130,9 @@ mod routes {
             let response = app.oneshot(batch_request).await.unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let batch_response: Vec<SimpleResponse> = serde_json::from_slice(&body).unwrap();
             assert_eq!(batch_response.len(), 3);
             assert_eq!(batch_response[0].status, 201); // Created
@@ -1124,9 +1152,53 @@ mod routes {
             let response = app.oneshot(request).await.unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let status_response: StatusResponse = serde_json::from_slice(&body).unwrap();
             assert_eq!(status_response.status, "OK");
+        }
+
+        #[tokio::test]
+        async fn test_error_handling() {
+            let app = setup_app().await;
+
+            // Test invalid JSON for CAS operation
+            let invalid_cas_request = Request::builder()
+                .method("POST")
+                .uri("/store/cas/some_key")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{invalid_json}"))
+                .unwrap();
+            let response = app.oneshot(invalid_cas_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_empty_key_value() {
+            let app = setup_app().await;
+
+            // Test putting an empty value
+            let put_request = Request::builder()
+                .method("PUT")
+                .uri("/store/empty_key")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(put_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+
+            // Test getting the empty value
+            let get_request = Request::builder()
+                .method("GET")
+                .uri("/store/empty_key")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(get_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty());
         }
     }
 }
