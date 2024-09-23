@@ -396,6 +396,123 @@ mod inner_map {
             None
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn test_insert_and_get() {
+            let mut map = InnerMap::default();
+            assert!(!map.insert("key1".to_string(), "value1".to_string(), None));
+            assert_eq!(map.len(), 1);
+
+            let entry = map.get("key1").unwrap();
+            assert_eq!(entry.value, "value1");
+            assert!(entry.expires.is_none());
+        }
+
+        #[test]
+        fn test_insert_with_ttl() {
+            let mut map = InnerMap::default();
+            assert!(!map.insert(
+                "key2".to_string(),
+                "value2".to_string(),
+                Some(Duration::from_secs(60))
+            ));
+
+            let entry = map.get("key2").unwrap();
+            assert_eq!(entry.value, "value2");
+            assert!(entry.expires.is_some());
+        }
+
+        #[test]
+        fn test_remove() {
+            let mut map = InnerMap::default();
+            map.insert("key3".to_string(), "value3".to_string(), None);
+            assert!(map.remove("key3"));
+            assert_eq!(map.len(), 0);
+            assert!(map.get("key3").is_none());
+        }
+
+        #[test]
+        fn test_compare_and_swap_success() {
+            let mut map = InnerMap::default();
+            map.insert("key4".to_string(), "old_value".to_string(), None);
+
+            assert_eq!(
+                map.compare_and_swap("key4", "old_value", "new_value".to_string()),
+                Some(true)
+            );
+
+            let entry = map.get("key4").unwrap();
+            assert_eq!(entry.value, "new_value");
+        }
+
+        #[test]
+        fn test_compare_and_swap_failure() {
+            let mut map = InnerMap::default();
+            map.insert("key5".to_string(), "current_value".to_string(), None);
+
+            assert_eq!(
+                map.compare_and_swap("key5", "wrong_value", "new_value".to_string()),
+                Some(false)
+            );
+
+            let entry = map.get("key5").unwrap();
+            assert_eq!(entry.value, "current_value");
+        }
+
+        #[test]
+        fn test_remove_if_outdated() {
+            let mut map = InnerMap::default();
+            map.insert(
+                "key6".to_string(),
+                "value6".to_string(),
+                Some(Duration::from_nanos(1)),
+            );
+
+            // Sleep to ensure the entry expires
+            std::thread::sleep(Duration::from_millis(1));
+
+            map.remove_if_outdated("key6");
+            assert!(map.get("key6").is_none());
+        }
+
+        #[test]
+        fn test_non_existent_key() {
+            let mut map = InnerMap::<String, String>::default();
+            assert!(map.get("non_existent").is_none());
+            assert!(!map.remove("non_existent"));
+            assert_eq!(
+                map.compare_and_swap("non_existent", "any", "new".to_string()),
+                None
+            );
+        }
+
+        #[test]
+        fn test_overwrite_existing_key() {
+            let mut map = InnerMap::default();
+            map.insert("key7".to_string(), "value7".to_string(), None);
+            assert!(map.insert("key7".to_string(), "new_value7".to_string(), None));
+
+            let entry = map.get("key7").unwrap();
+            assert_eq!(entry.value, "new_value7");
+        }
+
+        #[test]
+        fn test_len() {
+            let mut map = InnerMap::default();
+            assert_eq!(map.len(), 0);
+            map.insert("key8".to_string(), "value8".to_string(), None);
+            assert_eq!(map.len(), 1);
+            map.insert("key9".to_string(), "value9".to_string(), None);
+            assert_eq!(map.len(), 2);
+            map.remove("key8");
+            assert_eq!(map.len(), 1);
+        }
+    }
 }
 
 #[tracing::instrument(level = "trace", skip())]
