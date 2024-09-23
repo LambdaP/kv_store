@@ -330,10 +330,18 @@ async fn main() {
         .layer(GovernorLayer {
             config: governor_config,
         })
-        .with_state(kv_store);
+        .with_state(kv_store)
+        // The following is required
+        //   for the Governor layer to work properly.
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app,
+    )
+    .await
+    .unwrap();
 }
 
 mod routes {
