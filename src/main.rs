@@ -803,7 +803,7 @@ mod routes {
         ttl: Option<u64>,
     }
 
-    #[derive(Debug, Default, Serialize)]
+    #[derive(Debug, Default, Deserialize, Serialize)]
     pub struct StatusResponse {
         status: String,
         uptime: String,
@@ -966,6 +966,167 @@ mod routes {
             total_operations,
             server_time,
             version,
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+            Router,
+        };
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tower::ServiceExt; // for `oneshot` and `ready`
+
+        async fn setup_app() -> Router {
+            let (tx, _rx) = mpsc::channel(64);
+            let kv_store = Arc::new(KvStore::new(tx));
+            Router::new()
+                .route("/store/:key", get(get_key))
+                .route("/store/:key", put(put_key_val))
+                .route("/store/:key", delete(delete_key))
+                .route("/store/cas/:key", post(compare_and_swap))
+                .route("/batch", post(batch_process))
+                .route("/status", get(status))
+                .with_state(kv_store)
+        }
+
+        #[tokio::test]
+        async fn test_get_key() {
+            let app = setup_app().await;
+
+            // Insert a key-value pair
+            let put_request = Request::builder()
+                .method("PUT")
+                .uri("/store/test_key")
+                .body(Body::from("test_value"))
+                .unwrap();
+            let response = app.clone().oneshot(put_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+
+            // Test GET request
+            let get_request = Request::builder()
+                .method("GET")
+                .uri("/store/test_key")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(get_request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], b"test_value");
+        }
+
+        #[tokio::test]
+        async fn test_put_key_val() {
+            let app = setup_app().await;
+
+            let request = Request::builder()
+                .method("PUT")
+                .uri("/store/new_key")
+                .body(Body::from("new_value"))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        #[tokio::test]
+        async fn test_delete_key() {
+            let app = setup_app().await;
+
+            // Insert a key-value pair
+            let put_request = Request::builder()
+                .method("PUT")
+                .uri("/store/delete_key")
+                .body(Body::from("delete_value"))
+                .unwrap();
+            let response = app.clone().oneshot(put_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+
+            // Delete the key
+            let delete_request = Request::builder()
+                .method("DELETE")
+                .uri("/store/delete_key")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(delete_request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn test_compare_and_swap() {
+            let app = setup_app().await;
+
+            // Insert a key-value pair
+            let put_request = Request::builder()
+                .method("PUT")
+                .uri("/store/cas_key")
+                .body(Body::from("initial_value"))
+                .unwrap();
+            let response = app.clone().oneshot(put_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+
+            // Perform CAS operation
+            let cas_payload = serde_json::json!({
+                "expected": "initial_value",
+                "new": "new_value"
+            });
+            let cas_request = Request::builder()
+                .method("POST")
+                .uri("/store/cas/cas_key")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&cas_payload).unwrap()))
+                .unwrap();
+            let response = app.oneshot(cas_request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn test_batch_process() {
+            let app = setup_app().await;
+
+            let batch_payload = serde_json::json!([
+                {"method": "PUT", "key": "batch_key1", "value": "batch_value1"},
+                {"method": "GET", "key": "batch_key1"},
+                {"method": "DELETE", "key": "batch_key1"}
+            ]);
+            let batch_request = Request::builder()
+                .method("POST")
+                .uri("/batch")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&batch_payload).unwrap()))
+                .unwrap();
+            let response = app.oneshot(batch_request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let batch_response: Vec<SimpleResponse> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(batch_response.len(), 3);
+            assert_eq!(batch_response[0].status, 201); // Created
+            assert_eq!(batch_response[1].status, 200); // OK
+            assert_eq!(batch_response[2].status, 204); // No Content
+        }
+
+        #[tokio::test]
+        async fn test_status() {
+            let app = setup_app().await;
+
+            let request = Request::builder()
+                .method("GET")
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let status_response: StatusResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status_response.status, "OK");
         }
     }
 }
