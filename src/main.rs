@@ -268,6 +268,212 @@ mod store_interface {
             });
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        async fn setup_kvstore() -> KvStore {
+            let (tx, _rx) = mpsc::channel(64);
+            KvStore::new(tx)
+        }
+
+        #[tokio::test]
+        async fn test_insert_and_get() {
+            let store = setup_kvstore().await;
+            let key = "test_key".to_string();
+            let value = Bytes::from("test_value");
+
+            let insert_result = store.insert(key.clone(), value.clone(), None).await;
+            assert!(matches!(insert_result, KvStoreResponse::Created));
+
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::SuccessBody(body) if body == value));
+        }
+
+        #[tokio::test]
+        async fn test_insert_with_ttl() {
+            let store = setup_kvstore().await;
+            let key = "ttl_key".to_string();
+            let value = Bytes::from("ttl_value");
+
+            store
+                .insert(key.clone(), value.clone(), Some(Duration::from_millis(10)))
+                .await;
+
+            // Value should exist immediately
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::SuccessBody(_)));
+
+            // Wait for TTL to expire
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Value should be gone now
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::NotFound));
+        }
+
+        #[tokio::test]
+        async fn test_remove() {
+            let store = setup_kvstore().await;
+            let key = "remove_key".to_string();
+            let value = Bytes::from("remove_value");
+
+            store.insert(key.clone(), value, None).await;
+
+            let remove_result = store.remove(&key).await;
+            assert!(matches!(remove_result, KvStoreResponse::Success));
+
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::NotFound));
+        }
+
+        #[tokio::test]
+        async fn test_compare_and_swap() {
+            let store = setup_kvstore().await;
+            let key = "cas_key".to_string();
+            let initial_value = Bytes::from("initial_value");
+            let new_value = Bytes::from("new_value");
+
+            store.insert(key.clone(), initial_value.clone(), None).await;
+
+            // Successful CAS
+            let cas_result = store
+                .compare_and_swap(&key, &initial_value, new_value.clone())
+                .await;
+            assert!(matches!(cas_result, KvStoreResponse::Success));
+
+            // Failed CAS (value has changed)
+            let failed_cas_result = store
+                .compare_and_swap(&key, &initial_value, Bytes::from("another_value"))
+                .await;
+            assert!(matches!(failed_cas_result, KvStoreResponse::CasTestFailed));
+
+            // Verify final value
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::SuccessBody(body) if body == new_value));
+        }
+
+        #[tokio::test]
+        async fn test_metrics() {
+            let store = setup_kvstore().await;
+            let key = "metrics_key".to_string();
+            let value = Bytes::from("metrics_value");
+
+            store.insert(key.clone(), value.clone(), None).await;
+            store.get(&key).await;
+            store.remove(&key).await;
+            store
+                .compare_and_swap(&key, &value, Bytes::from("new_value"))
+                .await;
+
+            assert_eq!(store.metrics.total_put_ops(), 1);
+            assert_eq!(store.metrics.total_get_ops(), 1);
+            assert_eq!(store.metrics.total_delete_ops(), 1);
+            assert_eq!(store.metrics.total_cas_failure(), 1);
+            assert_eq!(store.metrics.total_cas_success(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_cleanup_received_keys() {
+            let (tx, mut rx) = mpsc::channel(64);
+            let store = Arc::new(KvStore::new(tx));
+            let key = "cleanup_key".to_string();
+            let value = Bytes::from("cleanup_value");
+
+            // Insert a key with a short TTL
+            store
+                .insert(key.clone(), value, Some(Duration::from_millis(10)))
+                .await;
+
+            // Wait for the TTL to expire
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Trigger a get operation to mark the key for removal
+            let _ = store.get(&key).await;
+
+            // Run the cleanup
+            let mut buf = Vec::new();
+            store.cleanup_received_keys(&mut rx, &mut buf).await;
+
+            // The key should now be removed
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::NotFound));
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_access() {
+            let store = Arc::new(setup_kvstore().await);
+            let key = Arc::new("concurrent_key".to_string());
+            let mut handles = vec![];
+
+            // Spawn 10 tasks to insert values concurrently
+            for i in 0..10 {
+                let store_clone = store.clone();
+                let key_clone = key.clone();
+                let handle = tokio::spawn(async move {
+                    let value = Bytes::from(format!("value_{}", i));
+                    store_clone.insert(key_clone.to_string(), value, None).await
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all insertions to complete
+            for handle in handles {
+                let _ = handle.await;
+            }
+
+            // Verify that only one value was inserted
+            let get_result = store.get(&key).await;
+            assert!(matches!(get_result, KvStoreResponse::SuccessBody(_)));
+
+            // Spawn 10 tasks to get the value concurrently
+            let mut get_handles = vec![];
+            for _ in 0..10 {
+                let store_clone = store.clone();
+                let key_clone = key.clone();
+                let handle = tokio::spawn(async move { store_clone.get(&key_clone).await });
+                get_handles.push(handle);
+            }
+
+            // Verify that all get operations succeed
+            for handle in get_handles {
+                let result = handle.await.unwrap();
+                assert!(matches!(result, KvStoreResponse::SuccessBody(_)));
+            }
+
+            _ = store
+                .insert(key.to_string(), Bytes::from(format!("value_0")), None)
+                .await;
+
+            // Test concurrent CAS operations
+            let mut cas_handles = vec![];
+            for i in 0..10 {
+                let store_clone = store.clone();
+                let key_clone = key.clone();
+                let handle = tokio::spawn(async move {
+                    let new_value = Bytes::from(format!("new_value_{}", i));
+                    store_clone
+                        .compare_and_swap(&key_clone, b"value_0", new_value)
+                        .await
+                });
+                cas_handles.push(handle);
+            }
+
+            // Verify that only one CAS operation succeeds
+            let mut success_count = 0;
+            for handle in cas_handles {
+                let result = handle.await.unwrap();
+                if matches!(result, KvStoreResponse::Success) {
+                    success_count += 1;
+                }
+            }
+            assert_eq!(success_count, 1);
+        }
+    }
 }
 
 mod inner_map {
