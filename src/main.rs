@@ -1,12 +1,8 @@
 use std::env;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 use axum::{
     routing::{delete, get, post, put},
@@ -17,140 +13,260 @@ use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
 use bytes::Bytes;
 
-use tracing::{debug, error, info};
+use tracing::{error, info};
+
+use crate::store_interface::KvStore;
 
 const DEFAULT_PORT: u16 = 3000;
 const MAX_BATCH_SIZE: usize = 1024;
 
-#[derive(Debug)]
-struct Metrics {
-    start_time: Instant,
-    get_count: AtomicU64,
-    put_count: AtomicU64,
-    delete_count: AtomicU64,
-    cas_success_count: AtomicU64,
-    cas_failure_count: AtomicU64,
-}
+mod store_interface {
+    use super::inner_map;
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+    };
+    use bytes::Bytes;
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+    use tokio::sync::{mpsc, RwLock};
+    use tracing::{debug, info};
 
-#[tracing::instrument(level = "trace", skip(n))]
-fn increment_au64(n: &AtomicU64) {
-    n.fetch_add(1, Ordering::Relaxed);
-}
+    #[derive(Debug, Default)]
+    struct AU64Counter(AtomicU64);
 
-impl Metrics {
-    #[tracing::instrument(level = "trace", skip())]
-    fn new() -> Self {
-        Metrics {
-            start_time: Instant::now(),
-            get_count: AtomicU64::default(),
-            put_count: AtomicU64::default(),
-            delete_count: AtomicU64::default(),
-            cas_success_count: AtomicU64::default(),
-            cas_failure_count: AtomicU64::default(),
+    impl AU64Counter {
+        fn increment(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn load(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn increment_get(&self) {
-        increment_au64(&self.get_count);
+    // TODO use a BTreeMap to store keys ordered by expiry date
+    #[derive(Debug)]
+    pub struct KvStore {
+        pub data: RwLock<inner_map::InnerMap<String, Bytes>>,
+        pub metrics: Metrics,
+        keys_removal_tx: mpsc::Sender<String>,
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn increment_put(&self) {
-        increment_au64(&self.put_count);
+    #[derive(Clone, Debug)]
+    pub enum KvStoreResponse {
+        Success,
+        SuccessBody(Bytes),
+        Created,
+        NotFound,
+        CasTestFailed,
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn increment_delete(&self) {
-        increment_au64(&self.delete_count);
-    }
+    impl KvStoreResponse {
+        pub fn into_status_body(self) -> (StatusCode, Option<Bytes>) {
+            let status = match self {
+                KvStoreResponse::Success => StatusCode::NO_CONTENT,
+                KvStoreResponse::SuccessBody(_) => StatusCode::OK,
+                KvStoreResponse::Created => StatusCode::CREATED,
+                KvStoreResponse::NotFound => StatusCode::NOT_FOUND,
+                KvStoreResponse::CasTestFailed => StatusCode::PRECONDITION_FAILED,
+            };
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn increment_cas_success(&self) {
-        increment_au64(&self.cas_success_count);
-    }
+            let body = match self {
+                KvStoreResponse::SuccessBody(body) => Some(body),
+                _ => None,
+            };
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn increment_cas_failure(&self) {
-        increment_au64(&self.cas_failure_count);
-    }
-}
-
-// TODO use a BTreeMap to store keys ordered by expiry date
-#[derive(Debug)]
-struct KvStore {
-    data: RwLock<inner_map::InnerMap<String, Bytes>>,
-    metrics: Metrics,
-    keys_removal_tx: mpsc::Sender<String>,
-}
-
-impl KvStore {
-    #[tracing::instrument(level = "trace", skip(tx))]
-    fn new(tx: mpsc::Sender<String>) -> KvStore {
-        KvStore {
-            data: RwLock::default(),
-            metrics: Metrics::new(),
-            keys_removal_tx: tx,
+            (status, body)
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(self, value))]
-    async fn insert(&self, key: String, value: Bytes, ttl: Option<Duration>) -> bool {
-        debug!("Inserting key: {}", key);
-        self.metrics.increment_put();
-        self.data.write().await.insert(key, value, ttl)
+    #[derive(Debug)]
+    pub struct Metrics {
+        pub start_time: Instant,
+        get_count: AU64Counter,
+        put_count: AU64Counter,
+        delete_count: AU64Counter,
+        cas_success_count: AU64Counter,
+        cas_failure_count: AU64Counter,
     }
 
-    #[tracing::instrument(level = "trace", skip(self, key))]
-    async fn get(&self, key: &str) -> Option<Bytes> {
-        debug!("Getting key: {}", key);
-        self.metrics.increment_get();
+    #[tracing::instrument(level = "trace", skip(n))]
+    fn increment_au64(n: &AtomicU64) {
+        n.fetch_add(1, Ordering::Relaxed);
+    }
 
-        let inner_map::StoreEntry { value, expires } = self.data.read().await.get(key)?;
-
-        match expires {
-            Some(expires_at) if expires_at < Instant::now() => {
-                self.mark_key_for_removal(key);
-                None
+    impl Metrics {
+        #[tracing::instrument(level = "trace", skip())]
+        fn new() -> Self {
+            Metrics {
+                start_time: Instant::now(),
+                get_count: AU64Counter::default(),
+                put_count: AU64Counter::default(),
+                delete_count: AU64Counter::default(),
+                cas_success_count: AU64Counter::default(),
+                cas_failure_count: AU64Counter::default(),
             }
-            _ => Some(value),
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment_get(&self) {
+            self.get_count.increment();
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment_put(&self) {
+            self.put_count.increment();
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment_delete(&self) {
+            self.delete_count.increment();
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment_cas_success(&self) {
+            self.cas_success_count.increment();
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment_cas_failure(&self) {
+            self.cas_failure_count.increment();
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn total_get_ops(&self) -> u64 {
+            self.get_count.load()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn total_put_ops(&self) -> u64 {
+            self.put_count.load()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn total_delete_ops(&self) -> u64 {
+            self.delete_count.load()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn total_cas_success(&self) -> u64 {
+            self.cas_success_count.load()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        pub fn total_cas_failure(&self) -> u64 {
+            self.cas_failure_count.load()
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(self, key))]
-    async fn remove(&self, key: &str) -> bool {
-        debug!("Removing key: {}", key);
-        self.metrics.increment_delete();
-        self.data.write().await.remove(key)
+    impl IntoResponse for KvStoreResponse {
+        fn into_response(self) -> Response {
+            let (status, body) = self.into_status_body();
+            (status, body.unwrap_or_default()).into_response()
+        }
     }
 
-    #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    async fn compare_and_swap(&self, key: &str, expected: &[u8], new: Bytes) -> Option<bool> {
-        debug!("Compare-and-swap on key: {}", key);
-        let res = self.data.read().await.compare_and_swap(key, expected, new);
-
-        if res == Some(true) {
-            self.metrics.increment_cas_success();
-        } else {
-            self.metrics.increment_cas_failure();
+    impl KvStore {
+        #[tracing::instrument(level = "trace", skip(tx))]
+        pub fn new(tx: mpsc::Sender<String>) -> KvStore {
+            KvStore {
+                data: RwLock::default(),
+                metrics: Metrics::new(),
+                keys_removal_tx: tx,
+            }
         }
 
-        res
-    }
+        #[tracing::instrument(level = "trace", skip(self, value))]
+        pub async fn insert(
+            &self,
+            key: String,
+            value: Bytes,
+            ttl: Option<Duration>,
+        ) -> KvStoreResponse {
+            debug!("Inserting key: {}", key);
+            self.metrics.increment_put();
+            if self.data.write().await.insert(key, value, ttl) {
+                KvStoreResponse::Success
+            } else {
+                KvStoreResponse::Created
+            }
+        }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn mark_key_for_removal(&self, key: &str) -> bool {
-        info!("Marking key {} for removal", key);
-        self.keys_removal_tx.try_send(key.into()).is_ok()
-    }
+        #[tracing::instrument(level = "trace", skip(self, key))]
+        pub async fn get(&self, key: &str) -> KvStoreResponse {
+            debug!("Getting key: {}", key);
+            self.metrics.increment_get();
 
-    #[tracing::instrument(level = "trace", skip(self, rx, buf))]
-    async fn cleanup_received_keys(&self, rx: &mut mpsc::Receiver<String>, buf: &mut Vec<String>) {
-        rx.recv_many(buf, rx.max_capacity()).await;
-        let mut store = self.data.write().await;
-        buf.drain(..).for_each(|key| {
-            _ = store.remove_if_outdated(&key);
-        });
+            let Some(inner_map::StoreEntry { value, expires }) = self.data.read().await.get(key)
+            else {
+                return KvStoreResponse::NotFound;
+            };
+
+            match expires {
+                Some(expires_at) if expires_at < Instant::now() => {
+                    self.mark_key_for_removal(key);
+                    KvStoreResponse::NotFound
+                }
+                _ => KvStoreResponse::SuccessBody(value),
+            }
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key))]
+        pub async fn remove(&self, key: &str) -> KvStoreResponse {
+            debug!("Removing key: {}", key);
+            self.metrics.increment_delete();
+
+            if self.data.write().await.remove(key) {
+                KvStoreResponse::Success
+            } else {
+                KvStoreResponse::NotFound
+            }
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
+        pub async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: &[u8],
+            new: Bytes,
+        ) -> KvStoreResponse {
+            debug!("Compare-and-swap on key: {}", key);
+            let Some(cas_result) = self.data.read().await.compare_and_swap(key, expected, new)
+            else {
+                self.metrics.increment_cas_failure();
+                return KvStoreResponse::NotFound;
+            };
+
+            if cas_result {
+                self.metrics.increment_cas_success();
+                KvStoreResponse::Success
+            } else {
+                self.metrics.increment_cas_failure();
+                KvStoreResponse::CasTestFailed
+            }
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn mark_key_for_removal(&self, key: &str) -> bool {
+            info!("Marking key {} for removal", key);
+            self.keys_removal_tx.try_send(key.into()).is_ok()
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, rx, buf))]
+        pub async fn cleanup_received_keys(
+            &self,
+            rx: &mut mpsc::Receiver<String>,
+            buf: &mut Vec<String>,
+        ) {
+            rx.recv_many(buf, rx.max_capacity()).await;
+            let mut store = self.data.write().await;
+            buf.drain(..).for_each(|key| {
+                _ = store.remove_if_outdated(&key);
+            });
+        }
     }
 }
 
@@ -338,12 +454,7 @@ async fn main() {
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
-    axum::serve(
-        listener,
-        app,
-    )
-    .await
-    .unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 mod routes {
@@ -415,14 +526,7 @@ mod routes {
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
-        if let Some(value) = kv_store.get(&key).await {
-            info!("Key found: {}", key);
-            debug!("Value: {:?}", value);
-            Ok(value)
-        } else {
-            info!("Key not found: {}", key);
-            Err(StatusCode::NOT_FOUND)
-        }
+        kv_store.get(&key).await
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store, value))]
@@ -433,13 +537,7 @@ mod routes {
         value: Bytes,
     ) -> impl IntoResponse {
         let ttl = query.ttl.map(Duration::from_secs);
-        if kv_store.insert(key, value, ttl).await {
-            info!("Key updated");
-            StatusCode::NO_CONTENT
-        } else {
-            info!("Key inserted");
-            StatusCode::CREATED
-        }
+        kv_store.insert(key, value, ttl).await
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
@@ -447,13 +545,7 @@ mod routes {
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
-        if kv_store.remove(&key).await {
-            info!("Key deleted: {}", key);
-            Ok(StatusCode::NO_CONTENT)
-        } else {
-            info!("Key not found for deletion: {}", key);
-            Err(StatusCode::NOT_FOUND)
-        }
+        kv_store.remove(&key).await
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
@@ -462,26 +554,11 @@ mod routes {
         Path(key): Path<String>,
         Json(cas_payload): Json<CasPayload>,
     ) -> impl IntoResponse {
-        if let Some(cas_success) = kv_store
+        kv_store
             .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
             .await
-        {
-            if cas_success {
-                info!("Compare-and-swap on key{}: values match", key);
-                Ok(StatusCode::NO_CONTENT)
-            } else {
-                info!("Compare-and-swap on key{}: values do not match", key);
-                Err(StatusCode::PRECONDITION_FAILED)
-            }
-        } else {
-            info!("Key not found for compare-and-swap: {}", key);
-            Err(StatusCode::NOT_FOUND)
-        }
     }
 
-    // TODO this duplicates API logic with other route handlers (get_key etc.)
-    //   obviously this is outrageous
-    //   and I should do something better
     #[tracing::instrument(level = "trace", skip(kv_store, requests))]
     pub async fn batch_process(
         State(kv_store): State<Arc<KvStore>>,
@@ -494,30 +571,18 @@ mod routes {
         let handles = requests.into_iter().map(|request| {
             let kv_store = kv_store.clone();
             match request {
-                SimpleRequest::Get { key } => tokio::task::spawn(async move {
-                    if let Some(value) = kv_store.get(&key).await {
-                        (StatusCode::OK, Some(value))
-                    } else {
-                        (StatusCode::NOT_FOUND, None)
-                    }
-                }),
+                SimpleRequest::Get { key } => {
+                    tokio::task::spawn(async move { kv_store.get(&key).await.into_status_body() })
+                }
                 SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
                     let ttl = ttl.map(Duration::from_secs);
-                    let status = if kv_store.insert(key, value, ttl).await {
-                        StatusCode::NO_CONTENT
-                    } else {
-                        StatusCode::CREATED
-                    };
-                    (status, None)
+                    kv_store.insert(key, value, ttl).await.into_status_body()
                 }),
-                SimpleRequest::Delete { key } => tokio::task::spawn(async move {
-                    let status = if kv_store.remove(&key).await {
-                        StatusCode::NO_CONTENT
-                    } else {
-                        StatusCode::NOT_FOUND
-                    };
-                    (status, None)
-                }),
+                SimpleRequest::Delete { key } => {
+                    tokio::task::spawn(
+                        async move { kv_store.remove(&key).await.into_status_body() },
+                    )
+                }
             }
         });
 
@@ -545,11 +610,11 @@ mod routes {
     async fn make_status(KvStore { data, metrics, .. }: &KvStore) -> StatusResponse {
         let total_keys = { data.read().await.len() };
 
-        let get_operations = metrics.get_count.load(Ordering::Relaxed);
-        let put_operations = metrics.put_count.load(Ordering::Relaxed);
-        let delete_operations = metrics.delete_count.load(Ordering::Relaxed);
-        let successful_cas_operations = metrics.cas_success_count.load(Ordering::Relaxed);
-        let failed_cas_operations = metrics.cas_failure_count.load(Ordering::Relaxed);
+        let get_operations = metrics.total_get_ops();
+        let put_operations = metrics.total_put_ops();
+        let delete_operations = metrics.total_delete_ops();
+        let successful_cas_operations = metrics.total_cas_success();
+        let failed_cas_operations = metrics.total_cas_failure();
         let cas_operations = successful_cas_operations + failed_cas_operations;
         let total_operations = get_operations + put_operations + delete_operations + cas_operations;
 
