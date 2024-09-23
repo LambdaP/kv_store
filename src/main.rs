@@ -15,6 +15,8 @@ use axum::{
 
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
+use bytes::Bytes;
+
 use tracing::{debug, error, info};
 
 const DEFAULT_PORT: u16 = 3000;
@@ -77,7 +79,7 @@ impl Metrics {
 // TODO use a BTreeMap to store keys ordered by expiry date
 #[derive(Debug)]
 struct KvStore {
-    data: RwLock<inner_map::InnerMap<String, String>>,
+    data: RwLock<inner_map::InnerMap<String, Bytes>>,
     metrics: Metrics,
     keys_removal_tx: mpsc::Sender<String>,
 }
@@ -93,14 +95,14 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, value))]
-    async fn insert(&self, key: String, value: String, ttl: Option<Duration>) -> bool {
+    async fn insert(&self, key: String, value: Bytes, ttl: Option<Duration>) -> bool {
         debug!("Inserting key: {}", key);
         self.metrics.increment_put();
         self.data.write().await.insert(key, value, ttl)
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    async fn get(&self, key: &str) -> Option<String> {
+    async fn get(&self, key: &str) -> Option<Bytes> {
         debug!("Getting key: {}", key);
         self.metrics.increment_get();
 
@@ -123,7 +125,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    async fn compare_and_swap(&self, key: &str, expected: &str, new: String) -> Option<bool> {
+    async fn compare_and_swap(&self, key: &str, expected: &[u8], new: Bytes) -> Option<bool> {
         debug!("Compare-and-swap on key: {}", key);
         let res = self.data.read().await.compare_and_swap(key, expected, new);
 
@@ -358,8 +360,8 @@ mod routes {
 
     #[derive(Debug, Default, Deserialize)]
     pub struct CasPayload {
-        expected: String,
-        new: String,
+        expected: Bytes,
+        new: Bytes,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -392,7 +394,7 @@ mod routes {
         },
         Put {
             key: String,
-            value: String,
+            value: Bytes,
             #[serde(skip_serializing_if = "Option::is_none")]
             ttl: Option<u64>,
         },
@@ -405,7 +407,7 @@ mod routes {
     struct SimpleResponse {
         status: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
-        value: Option<String>,
+        value: Option<Bytes>,
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
@@ -415,7 +417,7 @@ mod routes {
     ) -> impl IntoResponse {
         if let Some(value) = kv_store.get(&key).await {
             info!("Key found: {}", key);
-            debug!("Value: {}", value);
+            debug!("Value: {:?}", value);
             Ok(value)
         } else {
             info!("Key not found: {}", key);
@@ -428,7 +430,7 @@ mod routes {
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
         Query(query): Query<PutRequestQueryParams>,
-        value: String,
+        value: Bytes,
     ) -> impl IntoResponse {
         let ttl = query.ttl.map(Duration::from_secs);
         if kv_store.insert(key, value, ttl).await {
