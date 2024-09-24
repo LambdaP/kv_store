@@ -745,6 +745,71 @@ mod inner_map {
     }
 }
 
+mod utf8_bytes {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer};
+    use std::ops::Deref;
+    use std::str::Utf8Error;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct Utf8Bytes(Bytes);
+
+    impl TryFrom<Bytes> for Utf8Bytes {
+        type Error = Utf8Error;
+
+        fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+            _ = std::str::from_utf8(&bytes)?;
+
+            Ok(Utf8Bytes(bytes))
+        }
+    }
+
+    impl From<String> for Utf8Bytes {
+        fn from(s: String) -> Utf8Bytes {
+            Utf8Bytes(s.into())
+        }
+    }
+
+    impl Deref for Utf8Bytes {
+        type Target = str;
+
+        fn deref(&self) -> &str {
+            // Safe because UTF-8 was validated at construction
+            unsafe { std::str::from_utf8_unchecked(&self.0) }
+        }
+    }
+
+    impl AsRef<Bytes> for Utf8Bytes {
+        fn as_ref(&self) -> &Bytes {
+            &self.0
+        }
+    }
+
+    impl AsRef<[u8]> for Utf8Bytes {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl AsRef<str> for Utf8Bytes {
+        fn as_ref(&self) -> &str {
+            self
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Utf8Bytes {
+        fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            use serde::de::Error;
+            Bytes::deserialize(deserializer)?
+                .try_into()
+                .map_err(Error::custom)
+        }
+    }
+}
+
 #[tracing::instrument(level = "trace", skip())]
 #[tokio::main]
 async fn main() {
@@ -1002,7 +1067,7 @@ mod routes {
         };
         use std::sync::Arc;
         use tokio::sync::mpsc;
-        use tower::ServiceExt; // for `oneshot` and `ready`
+        use tower::ServiceExt; // for `oneshot`
 
         async fn setup_app() -> Router {
             let (tx, _rx) = mpsc::channel(64);
