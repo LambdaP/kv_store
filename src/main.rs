@@ -20,6 +20,66 @@ use crate::store_interface::KvStore;
 const DEFAULT_PORT: u16 = 3000;
 const MAX_BATCH_SIZE: usize = 1024;
 
+#[tracing::instrument(level = "trace", skip())]
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let port = env::var("KV_STORE_PORT")
+        .map_err(|err| match err {
+            env::VarError::NotPresent => {
+                info!("KV_STORE_PORT environment variable not set. Using default port: {}", DEFAULT_PORT);
+            }
+            env::VarError::NotUnicode(_) => {
+                error!("KV_STORE_PORT environment variable contains invalid UTF-8. Falling back to default port: {}", DEFAULT_PORT);
+            }
+        })
+            .and_then(|port_str| {
+            port_str.parse::<u16>().map_err(|_| {
+                error!("Invalid KV_STORE_PORT value: '{}'. Falling back to default port: {}", port_str, DEFAULT_PORT);
+            })
+        })
+        .inspect(|port| {
+            info!("Successfully read KV_STORE_PORT from environment: {}", port);
+        })
+            .unwrap_or(DEFAULT_PORT);
+
+    let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+
+    let (tx, mut rx) = mpsc::channel(64);
+
+    let kv_store = Arc::new(KvStore::new(tx));
+    let cleanup_store = kv_store.clone();
+
+    tokio::spawn(async move {
+        let mut buf = vec![];
+        loop {
+            cleanup_store.cleanup_received_keys(&mut rx, &mut buf).await;
+        }
+    });
+
+    let governor_config = Arc::new(GovernorConfig::default());
+
+    let app = Router::new()
+        .route("/store/:key", get(routes::get_key))
+        .route("/store/:key", put(routes::put_key_val))
+        .route("/store/:key", delete(routes::delete_key))
+        .route("/store/cas/:key", post(routes::compare_and_swap))
+        .route("/batch", post(routes::batch_process))
+        .route("/status", get(routes::status))
+        .layer(GovernorLayer {
+            config: governor_config,
+        })
+        .with_state(kv_store)
+        // The following is required
+        //   for the Governor layer to work properly.
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+
 mod store_interface {
     use super::inner_map;
     use axum::{
@@ -853,66 +913,6 @@ mod utf8_bytes {
         }
     }
 }
-
-#[tracing::instrument(level = "trace", skip())]
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt::init();
-
-    let port = env::var("KV_STORE_PORT")
-        .map_err(|err| match err {
-            env::VarError::NotPresent => {
-                info!("KV_STORE_PORT environment variable not set. Using default port: {}", DEFAULT_PORT);
-            }
-            env::VarError::NotUnicode(_) => {
-                error!("KV_STORE_PORT environment variable contains invalid UTF-8. Falling back to default port: {}", DEFAULT_PORT);
-            }
-        })
-            .and_then(|port_str| {
-            port_str.parse::<u16>().map_err(|_| {
-                error!("Invalid KV_STORE_PORT value: '{}'. Falling back to default port: {}", port_str, DEFAULT_PORT);
-            })
-        })
-        .inspect(|port| {
-            info!("Successfully read KV_STORE_PORT from environment: {}", port);
-        })
-            .unwrap_or(DEFAULT_PORT);
-
-    let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-
-    let (tx, mut rx) = mpsc::channel(64);
-
-    let kv_store = Arc::new(KvStore::new(tx));
-    let cleanup_store = kv_store.clone();
-
-    tokio::spawn(async move {
-        let mut buf = vec![];
-        loop {
-            cleanup_store.cleanup_received_keys(&mut rx, &mut buf).await;
-        }
-    });
-
-    let governor_config = Arc::new(GovernorConfig::default());
-
-    let app = Router::new()
-        .route("/store/:key", get(routes::get_key))
-        .route("/store/:key", put(routes::put_key_val))
-        .route("/store/:key", delete(routes::delete_key))
-        .route("/store/cas/:key", post(routes::compare_and_swap))
-        .route("/batch", post(routes::batch_process))
-        .route("/status", get(routes::status))
-        .layer(GovernorLayer {
-            config: governor_config,
-        })
-        .with_state(kv_store)
-        // The following is required
-        //   for the Governor layer to work properly.
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
-
-    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
-
 mod routes {
     #[allow(clippy::wildcard_imports)]
     use super::*;
