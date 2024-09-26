@@ -814,6 +814,24 @@ mod utf8_bytes {
         }
     }
 
+    impl PartialEq<Bytes> for Utf8Bytes {
+        fn eq(&self, other: &Bytes) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl PartialEq<[u8]> for Utf8Bytes {
+        fn eq(&self, other: &[u8]) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl<'a> PartialEq<&'a [u8]> for Utf8Bytes {
+        fn eq(&self, other: &&'a [u8]) -> bool {
+            self.0 == *other
+        }
+    }
+
     impl<'de> Deserialize<'de> for Utf8Bytes {
         fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
         where
@@ -908,12 +926,6 @@ mod routes {
     use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
 
     use crate::utf8_bytes::Utf8Bytes;
-
-    // #[derive(Debug, Default, Deserialize)]
-    // pub struct CasPayload {
-    //     expected: Bytes,
-    //     new: Bytes,
-    // }
 
     #[derive(Debug, Default, Deserialize)]
     pub struct CasPayload {
@@ -1117,28 +1129,23 @@ mod routes {
         }
     }
 
-    // FIXME this clones the string,
-    //   which I'm guessing can be avoided
-    //   by implementing IntoResponse from scratch
-    //   (see below)
     impl IntoResponse for Utf8Bytes {
         fn into_response(self) -> axum::response::Response {
-            String::from(&*self).into_response()
+            // String::from(&*self).into_response()
+            use axum::{http::header, body::Body};
+
+            const TEXT_PLAIN_UTF_8: &str = "text/plain; charset=utf-8";
+            const HEADER_VALUE: header::HeaderValue =
+                header::HeaderValue::from_static(TEXT_PLAIN_UTF_8);
+
+            let mut res = Body::from(Bytes::from(self)).into_response();
+            res.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HEADER_VALUE,
+            );
+            res
         }
     }
-
-    // impl IntoResponse for Utf8Bytes {
-    //     fn into_response(self) -> Response {
-    //         let s: String = self.into();
-    //         s.into_response()
-    //         // let mut res = Body::from(self).into_response();
-    //         // res.headers_mut().insert(
-    //         //     header::CONTENT_TYPE,
-    //         //     HeaderValue::from_static(mime::TEXT_PLAIN_UTF_8.as_ref()),
-    //         // );
-    //         // res
-    //     }
-    // }
 
     #[cfg(test)]
     mod tests {
