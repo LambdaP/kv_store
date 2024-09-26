@@ -79,7 +79,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-
 mod store_interface {
     use super::inner_map;
     use axum::{
@@ -1156,17 +1155,14 @@ mod routes {
         #[tracing::instrument(level = "trace", skip(self))]
         fn into_response(self) -> axum::response::Response {
             // String::from(&*self).into_response()
-            use axum::{http::header, body::Body};
+            use axum::{body::Body, http::header};
 
             const TEXT_PLAIN_UTF_8: &str = "text/plain; charset=utf-8";
             const HEADER_VALUE: header::HeaderValue =
                 header::HeaderValue::from_static(TEXT_PLAIN_UTF_8);
 
             let mut res = Body::from(Bytes::from(self)).into_response();
-            res.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HEADER_VALUE,
-            );
+            res.headers_mut().insert(header::CONTENT_TYPE, HEADER_VALUE);
             res
         }
     }
