@@ -26,13 +26,14 @@ mod store_interface {
         http::StatusCode,
         response::{IntoResponse, Response},
     };
-    use bytes::Bytes;
     use std::{
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, RwLock};
     use tracing::{debug, info};
+
+    use crate::utf8_bytes::Utf8Bytes;
 
     #[derive(Debug, Default)]
     struct AU64Counter(AtomicU64);
@@ -50,7 +51,7 @@ mod store_interface {
     // TODO use a BTreeMap to store keys ordered by expiry date
     #[derive(Debug)]
     pub struct KvStore {
-        pub data: RwLock<inner_map::InnerMap<String, Bytes>>,
+        pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
         pub metrics: Metrics,
         keys_removal_tx: mpsc::Sender<String>,
     }
@@ -58,14 +59,14 @@ mod store_interface {
     #[derive(Clone, Debug)]
     pub enum KvStoreResponse {
         Success,
-        SuccessBody(Bytes),
+        SuccessBody(Utf8Bytes),
         Created,
         NotFound,
         CasTestFailed,
     }
 
     impl KvStoreResponse {
-        pub fn into_status_body(self) -> (StatusCode, Option<Bytes>) {
+        pub fn into_status_body(self) -> (StatusCode, Option<Utf8Bytes>) {
             let status = match self {
                 KvStoreResponse::Success => StatusCode::NO_CONTENT,
                 KvStoreResponse::SuccessBody(_) => StatusCode::OK,
@@ -183,7 +184,7 @@ mod store_interface {
         pub async fn insert(
             &self,
             key: String,
-            value: Bytes,
+            value: Utf8Bytes,
             ttl: Option<Duration>,
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
@@ -227,12 +228,16 @@ mod store_interface {
         }
 
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-        pub async fn compare_and_swap(
+        pub async fn compare_and_swap<E>(
             &self,
             key: &str,
-            expected: &[u8],
-            new: Bytes,
-        ) -> KvStoreResponse {
+            expected: &E,
+            new: Utf8Bytes,
+        ) -> KvStoreResponse
+        where
+            E: ?Sized,
+            Utf8Bytes: PartialEq<E>,
+        {
             debug!("Compare-and-swap on key: {}", key);
             let Some(cas_result) = self.data.read().await.compare_and_swap(key, expected, new)
             else {
@@ -284,10 +289,10 @@ mod store_interface {
         #[tokio::test]
         async fn test_insert_and_get() {
             let store = setup_kvstore().await;
-            let key = "test_key".to_string();
-            let value = Bytes::from("test_value");
+            let key = "test_key";
+            let value = "test_value";
 
-            let insert_result = store.insert(key.clone(), value.clone(), None).await;
+            let insert_result = store.insert(key.into(), value.into(), None).await;
             assert!(matches!(insert_result, KvStoreResponse::Created));
 
             let get_result = store.get(&key).await;
@@ -297,11 +302,11 @@ mod store_interface {
         #[tokio::test]
         async fn test_insert_with_ttl() {
             let store = setup_kvstore().await;
-            let key = "ttl_key".to_string();
-            let value = Bytes::from("ttl_value");
+            let key = "ttl_key";
+            let value = "ttl_value";
 
             store
-                .insert(key.clone(), value.clone(), Some(Duration::from_millis(10)))
+                .insert(key.into(), value.into(), Some(Duration::from_millis(10)))
                 .await;
 
             // Value should exist immediately
@@ -319,10 +324,10 @@ mod store_interface {
         #[tokio::test]
         async fn test_remove() {
             let store = setup_kvstore().await;
-            let key = "remove_key".to_string();
-            let value = Bytes::from("remove_value");
+            let key = "remove_key";
+            let value = "remove_value";
 
-            store.insert(key.clone(), value, None).await;
+            store.insert(key.into(), value.into(), None).await;
 
             let remove_result = store.remove(&key).await;
             assert!(matches!(remove_result, KvStoreResponse::Success));
@@ -334,21 +339,21 @@ mod store_interface {
         #[tokio::test]
         async fn test_compare_and_swap() {
             let store = setup_kvstore().await;
-            let key = "cas_key".to_string();
-            let initial_value = Bytes::from("initial_value");
-            let new_value = Bytes::from("new_value");
+            let key = "cas_key";
+            let initial_value = "initial_value";
+            let new_value = "new_value";
 
-            store.insert(key.clone(), initial_value.clone(), None).await;
+            store.insert(key.into(), initial_value.into(), None).await;
 
             // Successful CAS
             let cas_result = store
-                .compare_and_swap(&key, &initial_value, new_value.clone())
+                .compare_and_swap(&key, &initial_value, new_value.into())
                 .await;
             assert!(matches!(cas_result, KvStoreResponse::Success));
 
             // Failed CAS (value has changed)
             let failed_cas_result = store
-                .compare_and_swap(&key, &initial_value, Bytes::from("another_value"))
+                .compare_and_swap(&key, &initial_value, "another_value".into())
                 .await;
             assert!(matches!(failed_cas_result, KvStoreResponse::CasTestFailed));
 
@@ -360,14 +365,14 @@ mod store_interface {
         #[tokio::test]
         async fn test_metrics() {
             let store = setup_kvstore().await;
-            let key = "metrics_key".to_string();
-            let value = Bytes::from("metrics_value");
+            let key = "metrics_key";
+            let value = "metrics_value";
 
-            store.insert(key.clone(), value.clone(), None).await;
+            store.insert(key.into(), value.into(), None).await;
             store.get(&key).await;
             store.remove(&key).await;
             store
-                .compare_and_swap(&key, &value, Bytes::from("new_value"))
+                .compare_and_swap(&key, &value, "new_value".into())
                 .await;
 
             assert_eq!(store.metrics.total_put_ops(), 1);
@@ -379,19 +384,16 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_metrics_accuracy() {
-            let (tx, _rx) = mpsc::channel(64);
+            let (tx, _) = mpsc::channel(64);
             let store = Arc::new(KvStore::new(tx));
+            let key = "key1";
 
             // Perform a series of operations
-            store
-                .insert("key1".to_string(), Bytes::from("value1"), None)
-                .await;
-            store.get("key1").await;
+            store.insert(key.into(), "value1".into(), None).await;
+            store.get(&key).await;
             store.get("non_existent").await;
-            store.remove("key1").await;
-            store
-                .compare_and_swap("key2", b"old", Bytes::from("new"))
-                .await;
+            store.remove(&key).await;
+            store.compare_and_swap("key2", "old", "new".into()).await;
 
             // Check metrics
             assert_eq!(store.metrics.total_put_ops(), 1);
@@ -405,12 +407,12 @@ mod store_interface {
         async fn test_cleanup_received_keys() {
             let (tx, mut rx) = mpsc::channel(64);
             let store = Arc::new(KvStore::new(tx));
-            let key = "cleanup_key".to_string();
-            let value = Bytes::from("cleanup_value");
+            let key = "cleanup_key";
+            let value = "cleanup_value";
 
             // Insert a key with a short TTL
             store
-                .insert(key.clone(), value, Some(Duration::from_millis(10)))
+                .insert(key.into(), value.into(), Some(Duration::from_millis(10)))
                 .await;
 
             // Wait for the TTL to expire
@@ -439,8 +441,10 @@ mod store_interface {
                 let store_clone = store.clone();
                 let key_clone = key.clone();
                 let handle = tokio::spawn(async move {
-                    let value = Bytes::from(format!("value_{}", i));
-                    store_clone.insert(key_clone.to_string(), value, None).await
+                    let value = format!("value_{}", i);
+                    store_clone
+                        .insert(key_clone.to_string(), value.into(), None)
+                        .await
                 });
                 handles.push(handle);
             }
@@ -470,7 +474,7 @@ mod store_interface {
             }
 
             _ = store
-                .insert(key.to_string(), Bytes::from(format!("value_0")), None)
+                .insert(key.to_string(), format!("value_0").into(), None)
                 .await;
 
             // Test concurrent CAS operations
@@ -479,9 +483,9 @@ mod store_interface {
                 let store_clone = store.clone();
                 let key_clone = key.clone();
                 let handle = tokio::spawn(async move {
-                    let new_value = Bytes::from(format!("new_value_{}", i));
+                    let new_value = format!("new_value_{}", i);
                     store_clone
-                        .compare_and_swap(&key_clone, b"value_0", new_value)
+                        .compare_and_swap(&key_clone, "value_0", new_value.into())
                         .await
                 });
                 cas_handles.push(handle);
@@ -526,33 +530,6 @@ mod inner_map {
         }
     }
 
-    // There is an inherent issue
-    //   with using a Mutex<V>
-    //   as the inner value
-    //   (which is required for atomic compare-and-swap).
-    // Reading the value
-    //   in the get() method
-    //   requires holding the lock
-    //   while cloning the value,
-    //   which possibly takes a long time to complete.
-    // A std::sync::Mutex should only be locked
-    //   for short periods of time,
-    //   because the underlying thread is blocked,
-    //   preventing progress on all tasks
-    //   that are dispatched to that thread.
-    // A possible solution
-    //   would be to use a Mutex<Arc<V>>
-    //   and return an Arc<V>,
-    //   only locking the mutex
-    //   while cloning the Arc<V>,
-    //   which is fast.
-    // As of right now
-    //   this shouldn't be a problem
-    //   since the inner value cannot be modified,
-    //   only overwritten,
-    //   thus at worse
-    //   the returned pointer no longer points
-    //   to the value held in the map.
     #[derive(Debug, Default)]
     pub struct InnerMap<K, V>(HashMap<K, Mutex<StoreEntry<V>>>);
 
@@ -630,37 +607,39 @@ mod inner_map {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::utf8_bytes::Utf8Bytes;
         use std::time::Duration;
 
         #[test]
         fn test_insert_and_get() {
-            let mut map = InnerMap::default();
-            assert!(!map.insert("key1".to_string(), "value1".to_string(), None));
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            let key = "key1";
+            let value = "value1";
+
+            assert!(!map.insert(key.into(), value.into(), None));
             assert_eq!(map.len(), 1);
 
-            let entry = map.get("key1").unwrap();
-            assert_eq!(entry.value, "value1");
+            let entry = map.get(key).unwrap();
+            assert_eq!(entry.value, value);
             assert!(entry.expires.is_none());
         }
 
         #[test]
         fn test_insert_with_ttl() {
-            let mut map = InnerMap::default();
-            assert!(!map.insert(
-                "key2".to_string(),
-                "value2".to_string(),
-                Some(Duration::from_secs(60))
-            ));
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            let key = "key2";
+            let value = "value2";
+            assert!(!map.insert(key.into(), value.into(), Some(Duration::from_secs(60))));
 
-            let entry = map.get("key2").unwrap();
-            assert_eq!(entry.value, "value2");
+            let entry = map.get(key).unwrap();
+            assert_eq!(entry.value, value);
             assert!(entry.expires.is_some());
         }
 
         #[test]
         fn test_remove() {
-            let mut map = InnerMap::default();
-            map.insert("key3".to_string(), "value3".to_string(), None);
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            map.insert("key3".into(), "value3".into(), None);
             assert!(map.remove("key3"));
             assert_eq!(map.len(), 0);
             assert!(map.get("key3").is_none());
@@ -668,25 +647,28 @@ mod inner_map {
 
         #[test]
         fn test_compare_and_swap_success() {
-            let mut map = InnerMap::default();
-            map.insert("key4".to_string(), "old_value".to_string(), None);
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            let key = "key4";
+            let old_value = "old_value";
+            let new_value = "new_value";
+            map.insert(key.into(), old_value.into(), None);
 
             assert_eq!(
-                map.compare_and_swap("key4", "old_value", "new_value".to_string()),
+                map.compare_and_swap(key, old_value, new_value.into()),
                 Some(true)
             );
 
-            let entry = map.get("key4").unwrap();
-            assert_eq!(entry.value, "new_value");
+            let entry = map.get(key).unwrap();
+            assert_eq!(entry.value, new_value);
         }
 
         #[test]
         fn test_compare_and_swap_failure() {
-            let mut map = InnerMap::default();
-            map.insert("key5".to_string(), "current_value".to_string(), None);
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            map.insert("key5".into(), "current_value".into(), None);
 
             assert_eq!(
-                map.compare_and_swap("key5", "wrong_value", "new_value".to_string()),
+                map.compare_and_swap("key5", "wrong_value", "new_value".into()),
                 Some(false)
             );
 
@@ -696,10 +678,10 @@ mod inner_map {
 
         #[test]
         fn test_remove_if_outdated() {
-            let mut map = InnerMap::default();
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
             map.insert(
-                "key6".to_string(),
-                "value6".to_string(),
+                "key6".into(),
+                "value6".into(),
                 Some(Duration::from_nanos(1)),
             );
 
@@ -712,20 +694,20 @@ mod inner_map {
 
         #[test]
         fn test_non_existent_key() {
-            let mut map = InnerMap::<String, String>::default();
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
             assert!(map.get("non_existent").is_none());
             assert!(!map.remove("non_existent"));
             assert_eq!(
-                map.compare_and_swap("non_existent", "any", "new".to_string()),
+                map.compare_and_swap("non_existent", "any", "new".into()),
                 None
             );
         }
 
         #[test]
         fn test_overwrite_existing_key() {
-            let mut map = InnerMap::default();
-            map.insert("key7".to_string(), "value7".to_string(), None);
-            assert!(map.insert("key7".to_string(), "new_value7".to_string(), None));
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
+            map.insert("key7".to_string(), "value7".into(), None);
+            assert!(map.insert("key7".into(), "new_value7".into(), None));
 
             let entry = map.get("key7").unwrap();
             assert_eq!(entry.value, "new_value7");
@@ -733,11 +715,11 @@ mod inner_map {
 
         #[test]
         fn test_len() {
-            let mut map = InnerMap::default();
+            let mut map = InnerMap::<String, Utf8Bytes>::default();
             assert_eq!(map.len(), 0);
-            map.insert("key8".to_string(), "value8".to_string(), None);
+            map.insert("key8".into(), "value8".into(), None);
             assert_eq!(map.len(), 1);
-            map.insert("key9".to_string(), "value9".to_string(), None);
+            map.insert("key9".into(), "value9".into(), None);
             assert_eq!(map.len(), 2);
             map.remove("key8");
             assert_eq!(map.len(), 1);
@@ -748,11 +730,34 @@ mod inner_map {
 mod utf8_bytes {
     use bytes::Bytes;
     use serde::{Deserialize, Deserializer};
+    use serde::{Serialize, Serializer};
     use std::ops::Deref;
     use std::str::Utf8Error;
 
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
     pub struct Utf8Bytes(Bytes);
+
+    impl Utf8Bytes {
+        pub fn from_static(s: &'static str) -> Self {
+            Utf8Bytes(Bytes::from_static(s.as_bytes()))
+        }
+
+        pub fn copy_from_slice(s: &str) -> Self {
+            s.to_string().into()
+        }
+    }
+
+    impl From<&'static str> for Utf8Bytes {
+        fn from(s: &'static str) -> Utf8Bytes {
+            Self::from_static(s)
+        }
+    }
+
+    impl From<String> for Utf8Bytes {
+        fn from(s: String) -> Utf8Bytes {
+            Utf8Bytes(s.into())
+        }
+    }
 
     impl TryFrom<Bytes> for Utf8Bytes {
         type Error = Utf8Error;
@@ -761,12 +766,6 @@ mod utf8_bytes {
             _ = std::str::from_utf8(&bytes)?;
 
             Ok(Utf8Bytes(bytes))
-        }
-    }
-
-    impl From<String> for Utf8Bytes {
-        fn from(s: String) -> Utf8Bytes {
-            Utf8Bytes(s.into())
         }
     }
 
@@ -797,6 +796,24 @@ mod utf8_bytes {
         }
     }
 
+    impl From<Utf8Bytes> for Bytes {
+        fn from(utf8_bytes: Utf8Bytes) -> Bytes {
+            utf8_bytes.0
+        }
+    }
+
+    impl PartialEq<str> for Utf8Bytes {
+        fn eq(&self, other: &str) -> bool {
+            **self == *other
+        }
+    }
+
+    impl<'a> PartialEq<&'a str> for Utf8Bytes {
+        fn eq(&self, other: &&'a str) -> bool {
+            **self == **other
+        }
+    }
+
     impl<'de> Deserialize<'de> for Utf8Bytes {
         fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
         where
@@ -806,6 +823,15 @@ mod utf8_bytes {
             Bytes::deserialize(deserializer)?
                 .try_into()
                 .map_err(Error::custom)
+        }
+    }
+
+    impl Serialize for Utf8Bytes {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(self)
         }
     }
 }
@@ -881,10 +907,18 @@ mod routes {
     use std::time::{Duration, Instant};
     use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
 
+    use crate::utf8_bytes::Utf8Bytes;
+
+    // #[derive(Debug, Default, Deserialize)]
+    // pub struct CasPayload {
+    //     expected: Bytes,
+    //     new: Bytes,
+    // }
+
     #[derive(Debug, Default, Deserialize)]
     pub struct CasPayload {
-        expected: Bytes,
-        new: Bytes,
+        expected: Utf8Bytes,
+        new: Utf8Bytes,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -917,7 +951,7 @@ mod routes {
         },
         Put {
             key: String,
-            value: Bytes,
+            value: Utf8Bytes,
             #[serde(skip_serializing_if = "Option::is_none")]
             ttl: Option<u64>,
         },
@@ -930,7 +964,7 @@ mod routes {
     struct SimpleResponse {
         status: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
-        value: Option<Bytes>,
+        value: Option<Utf8Bytes>,
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store))]
@@ -946,7 +980,7 @@ mod routes {
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
         Query(query): Query<PutRequestQueryParams>,
-        value: Bytes,
+        value: Utf8Bytes,
     ) -> impl IntoResponse {
         let ttl = query.ttl.map(Duration::from_secs);
         kv_store.insert(key, value, ttl).await
@@ -1057,6 +1091,55 @@ mod routes {
             version,
         }
     }
+
+    // This should live somewhere else
+    use axum::async_trait;
+    use axum::extract::Request;
+
+    #[async_trait]
+    impl<S> axum::extract::FromRequest<S> for Utf8Bytes
+    where
+        S: Send + Sync,
+    {
+        type Rejection = (StatusCode, String);
+
+        async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+            let body = Bytes::from_request(req, state)
+                .await
+                .map_err(|err| (err.status(), err.body_text()))?;
+
+            body.try_into().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Request body didn't contain valid UTF-8".into(),
+                )
+            })
+        }
+    }
+
+    // FIXME this clones the string,
+    //   which I'm guessing can be avoided
+    //   by implementing IntoResponse from scratch
+    //   (see below)
+    impl IntoResponse for Utf8Bytes {
+        fn into_response(self) -> axum::response::Response {
+            String::from(&*self).into_response()
+        }
+    }
+
+    // impl IntoResponse for Utf8Bytes {
+    //     fn into_response(self) -> Response {
+    //         let s: String = self.into();
+    //         s.into_response()
+    //         // let mut res = Body::from(self).into_response();
+    //         // res.headers_mut().insert(
+    //         //     header::CONTENT_TYPE,
+    //         //     HeaderValue::from_static(mime::TEXT_PLAIN_UTF_8.as_ref()),
+    //         // );
+    //         // res
+    //     }
+    // }
+
     #[cfg(test)]
     mod tests {
         use super::*;
