@@ -99,10 +99,12 @@ mod store_interface {
     struct AU64Counter(AtomicU64);
 
     impl AU64Counter {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn increment(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 
+        #[tracing::instrument(level = "trace", skip(self))]
         fn load(&self) -> u64 {
             self.0.load(Ordering::Relaxed)
         }
@@ -126,6 +128,7 @@ mod store_interface {
     }
 
     impl KvStoreResponse {
+        #[tracing::instrument(level = "trace", skip(self))]
         pub fn into_status_body(self) -> (StatusCode, Option<Utf8Bytes>) {
             let status = match self {
                 KvStoreResponse::Success => StatusCode::NO_CONTENT,
@@ -224,6 +227,7 @@ mod store_interface {
     }
 
     impl IntoResponse for KvStoreResponse {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn into_response(self) -> Response {
             let (status, body) = self.into_status_body();
             (status, body.unwrap_or_default()).into_response()
@@ -341,6 +345,7 @@ mod store_interface {
         use std::time::Duration;
         use tokio::sync::mpsc;
 
+        #[tracing::instrument(level = "trace", skip())]
         async fn setup_kvstore() -> KvStore {
             let (tx, _rx) = mpsc::channel(64);
             KvStore::new(tx)
@@ -798,22 +803,26 @@ mod utf8_bytes {
     pub struct Utf8Bytes(Bytes);
 
     impl Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(s))]
         pub fn from_static(s: &'static str) -> Self {
             Utf8Bytes(Bytes::from_static(s.as_bytes()))
         }
 
+        #[tracing::instrument(level = "trace", skip(s))]
         pub fn copy_from_slice(s: &str) -> Self {
             s.to_string().into()
         }
     }
 
     impl From<&'static str> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(s))]
         fn from(s: &'static str) -> Utf8Bytes {
             Self::from_static(s)
         }
     }
 
     impl From<String> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(s))]
         fn from(s: String) -> Utf8Bytes {
             Utf8Bytes(s.into())
         }
@@ -822,6 +831,7 @@ mod utf8_bytes {
     impl TryFrom<Bytes> for Utf8Bytes {
         type Error = Utf8Error;
 
+        #[tracing::instrument(level = "trace", skip(bytes))]
         fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
             _ = std::str::from_utf8(&bytes)?;
 
@@ -832,6 +842,7 @@ mod utf8_bytes {
     impl Deref for Utf8Bytes {
         type Target = str;
 
+        #[tracing::instrument(level = "trace", skip(self))]
         fn deref(&self) -> &str {
             // Safe because UTF-8 was validated at construction
             unsafe { std::str::from_utf8_unchecked(&self.0) }
@@ -839,60 +850,70 @@ mod utf8_bytes {
     }
 
     impl AsRef<Bytes> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &Bytes {
             &self.0
         }
     }
 
     impl AsRef<[u8]> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &[u8] {
             &self.0
         }
     }
 
     impl AsRef<str> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &str {
             self
         }
     }
 
     impl From<Utf8Bytes> for Bytes {
+        #[tracing::instrument(level = "trace", skip(utf8_bytes))]
         fn from(utf8_bytes: Utf8Bytes) -> Bytes {
             utf8_bytes.0
         }
     }
 
     impl PartialEq<str> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &str) -> bool {
             **self == *other
         }
     }
 
     impl<'a> PartialEq<&'a str> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &&'a str) -> bool {
             **self == **other
         }
     }
 
     impl PartialEq<Bytes> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &Bytes) -> bool {
             self.0 == *other
         }
     }
 
     impl PartialEq<[u8]> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &[u8]) -> bool {
             self.0 == *other
         }
     }
 
     impl<'a> PartialEq<&'a [u8]> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &&'a [u8]) -> bool {
             self.0 == *other
         }
     }
 
     impl<'de> Deserialize<'de> for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(deserializer))]
         fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
         where
             D: Deserializer<'de>,
@@ -905,6 +926,7 @@ mod utf8_bytes {
     }
 
     impl Serialize for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self, serializer))]
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
@@ -1115,6 +1137,7 @@ mod routes {
     {
         type Rejection = (StatusCode, String);
 
+        #[tracing::instrument(level = "trace", skip(req, state))]
         async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
             let body = Bytes::from_request(req, state)
                 .await
@@ -1130,6 +1153,7 @@ mod routes {
     }
 
     impl IntoResponse for Utf8Bytes {
+        #[tracing::instrument(level = "trace", skip(self))]
         fn into_response(self) -> axum::response::Response {
             // String::from(&*self).into_response()
             use axum::{http::header, body::Body};
@@ -1159,6 +1183,7 @@ mod routes {
         use tokio::sync::mpsc;
         use tower::ServiceExt; // for `oneshot`
 
+        #[tracing::instrument(level = "trace", skip())]
         async fn setup_app() -> Router {
             let (tx, _rx) = mpsc::channel(64);
             let kv_store = Arc::new(KvStore::new(tx));
