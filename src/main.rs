@@ -252,11 +252,12 @@ mod store_interface {
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
             self.metrics.increment_put();
-            if self.data.write().await.insert(key, value, ttl) {
-                KvStoreResponse::Success
-            } else {
-                KvStoreResponse::Created
+            if self.data.read().await.try_swap(&key, value.clone(), ttl) {
+                return KvStoreResponse::Success;
             }
+
+            self.data.write().await.insert(key, value, ttl);
+            KvStoreResponse::Created
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -614,6 +615,19 @@ mod inner_map {
             self.0.insert(key, entry.into()).is_some()
         }
 
+        pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> bool
+        where
+            K: Borrow<Q>,
+            Q: Hash + Eq + ?Sized,
+        {
+            self.0
+                .get(key)
+                .map(|locked_entry| {
+                    *locked_entry.lock().unwrap() = StoreEntry::new(value, ttl);
+                })
+                .is_some()
+        }
+
         #[tracing::instrument(level = "trace", skip(self, key))]
         pub fn get<Q>(&self, key: &Q) -> Option<StoreEntry<V>>
         where
@@ -633,6 +647,7 @@ mod inner_map {
             self.0.remove(key).is_some()
         }
 
+        // TODO ttl?
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
         pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Option<bool>
         where
@@ -825,8 +840,7 @@ mod utf8_bytes {
         type Error = Utf8Error;
 
         fn try_from(bytes: &'static [u8]) -> Result<Self, Self::Error> {
-            std::str::from_utf8(bytes)
-                .map(Self::from_static)
+            std::str::from_utf8(bytes).map(Self::from_static)
         }
     }
 
