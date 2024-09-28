@@ -798,50 +798,74 @@ mod utf8_bytes {
     use std::ops::Deref;
     use std::str::Utf8Error;
 
-    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
     pub struct Utf8Bytes(Bytes);
 
     impl Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(s))]
-        pub fn from_static(s: &'static str) -> Self {
-            Utf8Bytes(Bytes::from_static(s.as_bytes()))
+        pub const fn from_static(s: &'static str) -> Self {
+            Self(Bytes::from_static(s.as_bytes()))
         }
 
-        #[tracing::instrument(level = "trace", skip(s))]
+        pub const unsafe fn from_bytes_unchecked(bytes: Bytes) -> Self {
+            Self(bytes)
+        }
+
         pub fn copy_from_slice(s: &str) -> Self {
-            s.to_string().into()
+            Self(Bytes::copy_from_slice(s.as_bytes()))
         }
     }
 
     impl From<&'static str> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(s))]
         fn from(s: &'static str) -> Utf8Bytes {
             Self::from_static(s)
         }
     }
 
+    impl TryFrom<&'static [u8]> for Utf8Bytes {
+        type Error = Utf8Error;
+
+        fn try_from(bytes: &'static [u8]) -> Result<Self, Self::Error> {
+            std::str::from_utf8(bytes)
+                .map(Self::from_static)
+        }
+    }
+
+    impl From<Box<str>> for Utf8Bytes {
+        fn from(s: Box<str>) -> Utf8Bytes {
+            // TODO this might be slightly suboptimal
+            Self(Bytes::from(String::from(s)))
+        }
+    }
+
+    impl TryFrom<Box<[u8]>> for Utf8Bytes {
+        type Error = Utf8Error;
+
+        fn try_from(bytes: Box<[u8]>) -> Result<Self, Self::Error> {
+            _ = std::str::from_utf8(&bytes)?;
+
+            Ok(Self(Bytes::from(bytes)))
+        }
+    }
+
     impl From<String> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(s))]
         fn from(s: String) -> Utf8Bytes {
-            Utf8Bytes(s.into())
+            Self(Bytes::from(s))
         }
     }
 
     impl TryFrom<Bytes> for Utf8Bytes {
         type Error = Utf8Error;
 
-        #[tracing::instrument(level = "trace", skip(bytes))]
         fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
             _ = std::str::from_utf8(&bytes)?;
 
-            Ok(Utf8Bytes(bytes))
+            Ok(Self(bytes))
         }
     }
 
     impl Deref for Utf8Bytes {
         type Target = str;
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn deref(&self) -> &str {
             // Safe because UTF-8 was validated at construction
             unsafe { std::str::from_utf8_unchecked(&self.0) }
@@ -849,70 +873,60 @@ mod utf8_bytes {
     }
 
     impl AsRef<Bytes> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &Bytes {
             &self.0
         }
     }
 
     impl AsRef<[u8]> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &[u8] {
             &self.0
         }
     }
 
     impl AsRef<str> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self))]
         fn as_ref(&self) -> &str {
             self
         }
     }
 
     impl From<Utf8Bytes> for Bytes {
-        #[tracing::instrument(level = "trace", skip(utf8_bytes))]
         fn from(utf8_bytes: Utf8Bytes) -> Bytes {
             utf8_bytes.0
         }
     }
 
     impl PartialEq<str> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &str) -> bool {
             **self == *other
         }
     }
 
     impl<'a> PartialEq<&'a str> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &&'a str) -> bool {
             **self == **other
         }
     }
 
     impl PartialEq<Bytes> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &Bytes) -> bool {
             self.0 == *other
         }
     }
 
     impl PartialEq<[u8]> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &[u8]) -> bool {
             self.0 == *other
         }
     }
 
     impl<'a> PartialEq<&'a [u8]> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, other))]
         fn eq(&self, other: &&'a [u8]) -> bool {
             self.0 == *other
         }
     }
 
     impl<'de> Deserialize<'de> for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(deserializer))]
         fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
         where
             D: Deserializer<'de>,
@@ -925,7 +939,6 @@ mod utf8_bytes {
     }
 
     impl Serialize for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self, serializer))]
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
