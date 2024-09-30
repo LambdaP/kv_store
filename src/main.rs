@@ -309,18 +309,19 @@ mod store_interface {
             Utf8Bytes: PartialEq<E>,
         {
             debug!("Compare-and-swap on key: {}", key);
-            let Some(cas_result) = self.data.read().await.compare_and_swap(key, expected, new)
-            else {
-                self.metrics.increment_cas_failure();
-                return KvStoreResponse::NotFound;
-            };
-
-            if cas_result {
-                self.metrics.increment_cas_success();
-                KvStoreResponse::Success
-            } else {
-                self.metrics.increment_cas_failure();
-                KvStoreResponse::CasTestFailed
+            match self.data.read().await.compare_and_swap(key, expected, new) {
+                Ok(_) => {
+                    self.metrics.increment_cas_success();
+                    KvStoreResponse::Success
+                }
+                Err(key_was_there) => {
+                    self.metrics.increment_cas_failure();
+                    if key_was_there {
+                        KvStoreResponse::CasTestFailed
+                    } else {
+                        KvStoreResponse::NotFound
+                    }
+                }
             }
         }
 
@@ -680,25 +681,25 @@ mod inner_map {
 
         // TODO ttl?
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-        pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Option<bool>
+        pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Result<u64, bool>
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
             E: ?Sized,
             V: PartialEq<E>,
         {
-            let locked_entry = self.data.get(key)?;
+            let locked_entry = self.data.get(key).ok_or(false)?;
 
             let mut guard = locked_entry.lock().unwrap();
 
-            let cas_success = guard.value == *expected;
-
-            if cas_success {
-                guard.update_value(new);
-                let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            if guard.value != *expected {
+                return Err(true);
             }
 
-            Some(cas_success)
+            guard.update_value(new);
+            let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+
+            Ok(op_rank)
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -783,10 +784,9 @@ mod inner_map {
             let new_value = "new_value";
             map.insert(key.into(), old_value.into(), None);
 
-            assert_eq!(
-                map.compare_and_swap(key, old_value, new_value.into()),
-                Some(true)
-            );
+            assert!(map
+                .compare_and_swap(key, old_value, new_value.into())
+                .is_ok());
 
             let entry = map.get(key).unwrap();
             assert_eq!(entry.value, new_value);
@@ -799,7 +799,7 @@ mod inner_map {
 
             assert_eq!(
                 map.compare_and_swap("key5", "wrong_value", "new_value".into()),
-                Some(false)
+                Err(true)
             );
 
             let entry = map.get("key5").unwrap();
@@ -829,7 +829,7 @@ mod inner_map {
             assert!(map.remove("non_existent").is_none());
             assert_eq!(
                 map.compare_and_swap("non_existent", "any", "new".into()),
-                None
+                Err(false)
             );
         }
 
