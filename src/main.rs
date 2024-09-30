@@ -616,21 +616,21 @@ mod inner_map {
 
         // Returns whether the key was present
         #[tracing::instrument(level = "trace", skip(self, key, value))]
-        pub fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
+        pub fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> (u64, bool) {
             use std::collections::hash_map::Entry;
 
             let new_entry = StoreEntry::new(value, ttl);
             match self.data.entry(key) {
                 Entry::Occupied(o) => {
                     let mut guard = o.get().lock().unwrap();
-                    let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+                    let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
                     *guard = new_entry;
-                    true
+                    (op_rank, true)
                 }
                 Entry::Vacant(o) => {
-                    let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+                    let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
                     o.insert(Mutex::new(new_entry));
-                    false
+                    (op_rank, false)
                 }
             }
         }
@@ -741,7 +741,7 @@ mod inner_map {
             let key = "key1";
             let value = "value1";
 
-            assert!(!map.insert(key.into(), value.into(), None));
+            assert!(!map.insert(key.into(), value.into(), None).1);
             assert_eq!(map.len(), 1);
 
             let entry = map.get(key).unwrap();
@@ -754,7 +754,7 @@ mod inner_map {
             let mut map = InnerMap::<String, Utf8Bytes>::default();
             let key = "key2";
             let value = "value2";
-            assert!(!map.insert(key.into(), value.into(), Some(Duration::from_secs(60))));
+            assert!(!map.insert(key.into(), value.into(), Some(Duration::from_secs(60))).1);
 
             let entry = map.get(key).unwrap();
             assert_eq!(entry.value, value);
@@ -832,7 +832,7 @@ mod inner_map {
         fn test_overwrite_existing_key() {
             let mut map = InnerMap::<String, Utf8Bytes>::default();
             map.insert("key7".to_string(), "value7".into(), None);
-            assert!(map.insert("key7".into(), "new_value7".into(), None));
+            assert!(map.insert("key7".into(), "new_value7".into(), None).1);
 
             let entry = map.get("key7").unwrap();
             assert_eq!(entry.value, "new_value7");
