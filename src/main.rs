@@ -573,7 +573,10 @@ mod inner_map {
     use std::borrow::Borrow;
     use std::collections::HashMap;
     use std::hash::Hash;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
     use std::time::{Duration, Instant};
 
     #[derive(Debug, Default, Clone)]
@@ -597,7 +600,8 @@ mod inner_map {
 
     #[derive(Debug, Default)]
     pub struct InnerMap<K, V> {
-        data: HashMap<K, Mutex<StoreEntry<V>>>
+        data: HashMap<K, Mutex<StoreEntry<V>>>,
+        mut_count: AtomicU64,
     }
 
     impl<K, V> InnerMap<K, V>
@@ -618,10 +622,13 @@ mod inner_map {
             let new_entry = StoreEntry::new(value, ttl);
             match self.data.entry(key) {
                 Entry::Occupied(o) => {
-                    *o.get().lock().unwrap() = new_entry;
+                    let mut guard = o.get().lock().unwrap();
+                    let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+                    *guard = new_entry;
                     true
                 }
                 Entry::Vacant(o) => {
+                    let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
                     o.insert(Mutex::new(new_entry));
                     false
                 }
@@ -633,12 +640,16 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.data
-                .get(key)
-                .map(|locked_entry| {
-                    *locked_entry.lock().unwrap() = StoreEntry::new(value, ttl);
-                })
-                .is_some()
+            let Some(locked_entry) = self.data.get(key) else {
+                return false;
+            };
+
+            let new_entry = StoreEntry::new(value, ttl);
+
+            let mut guard = locked_entry.lock().unwrap();
+            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            *guard = new_entry;
+            true
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -647,10 +658,8 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            // TODO deal with a poisoned mutex
-            self.data
-                .get(key)
-                .map(|entry| (entry.lock().unwrap()).clone())
+            let locked_entry = self.data.get(key)?;
+            Some(locked_entry.lock().unwrap().clone())
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -659,7 +668,12 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.data.remove(key).is_some()
+            let Some(_) = self.data.remove(key) else {
+                return false;
+            };
+
+            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            true
         }
 
         // TODO ttl?
@@ -671,30 +685,47 @@ mod inner_map {
             E: ?Sized,
             V: PartialEq<E>,
         {
-            self.data.get(key).map(|locked_entry| {
-                let mut entry = locked_entry.lock().unwrap();
-                if entry.value == *expected {
-                    entry.update_value(new);
-                    true
-                } else {
-                    false
-                }
-            })
+            let locked_entry = self.data.get(key)?;
+
+            let mut guard = locked_entry.lock().unwrap();
+
+            let cas_success = guard.value == *expected;
+
+            if cas_success {
+                guard.update_value(new);
+                let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            }
+
+            Some(cas_success)
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
-        pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> Option<()>
+        pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> bool
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            let expires = { self.data.get(key)?.lock().unwrap().expires? };
+            let expires = {
+                let Some(locked_entry) = self.data.get(key) else {
+                    return false;
+                };
 
-            if expires < Instant::now() {
-                self.data.remove(key);
+                let guard = locked_entry.lock().unwrap();
+
+                let Some(expires) = guard.expires else {
+                    return false;
+                };
+
+                expires
+            };
+
+            if expires > Instant::now() {
+                return false;
             }
 
-            None
+            self.data.remove(key);
+            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 
