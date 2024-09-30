@@ -243,6 +243,14 @@ mod store_interface {
             }
         }
 
+        // TODO Tokio prioritises writer access on RwStores
+        //   to avoid the case of readers starving writers.
+        // Here and in other places,
+        //   the strategy of obtaining read access
+        //   and relying on inner mutability
+        //   to modify the store
+        //   could similarly lead to readers starving writers
+        //   on individual keys.
         #[tracing::instrument(level = "trace", skip(self, value))]
         pub async fn insert(
             &self,
@@ -262,7 +270,10 @@ mod store_interface {
                 return KvStoreResponse::Success;
             }
 
-            self.data.write().await.insert(key, value, ttl);
+            if self.data.write().await.insert(key, value, ttl).1 {
+                return KvStoreResponse::Success;
+            }
+
             KvStoreResponse::Created
         }
 
