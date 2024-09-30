@@ -252,7 +252,13 @@ mod store_interface {
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
             self.metrics.increment_put();
-            if self.data.read().await.try_swap(&key, value.clone(), ttl) {
+            if self
+                .data
+                .read()
+                .await
+                .try_swap(&key, value.clone(), ttl)
+                .is_some()
+            {
                 return KvStoreResponse::Success;
             }
 
@@ -635,21 +641,19 @@ mod inner_map {
             }
         }
 
-        pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> bool
+        pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> Option<u64>
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            let Some(locked_entry) = self.data.get(key) else {
-                return false;
-            };
+            let locked_entry = self.data.get(key)?;
 
             let new_entry = StoreEntry::new(value, ttl);
 
             let mut guard = locked_entry.lock().unwrap();
-            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
             *guard = new_entry;
-            true
+            Some(op_rank)
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -754,7 +758,10 @@ mod inner_map {
             let mut map = InnerMap::<String, Utf8Bytes>::default();
             let key = "key2";
             let value = "value2";
-            assert!(!map.insert(key.into(), value.into(), Some(Duration::from_secs(60))).1);
+            assert!(
+                !map.insert(key.into(), value.into(), Some(Duration::from_secs(60)))
+                    .1
+            );
 
             let entry = map.get(key).unwrap();
             assert_eq!(entry.value, value);
