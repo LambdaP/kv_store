@@ -596,7 +596,9 @@ mod inner_map {
     }
 
     #[derive(Debug, Default)]
-    pub struct InnerMap<K, V>(HashMap<K, Mutex<StoreEntry<V>>>);
+    pub struct InnerMap<K, V> {
+        data: HashMap<K, Mutex<StoreEntry<V>>>
+    }
 
     impl<K, V> InnerMap<K, V>
     where
@@ -605,7 +607,7 @@ mod inner_map {
     {
         #[tracing::instrument(level = "trace", skip(self))]
         pub fn len(&self) -> usize {
-            self.0.len()
+            self.data.len()
         }
 
         // Returns whether the key was present
@@ -614,7 +616,7 @@ mod inner_map {
             use std::collections::hash_map::Entry;
 
             let new_entry = StoreEntry::new(value, ttl);
-            match self.0.entry(key) {
+            match self.data.entry(key) {
                 Entry::Occupied(o) => {
                     *o.get().lock().unwrap() = new_entry;
                     true
@@ -631,7 +633,7 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.0
+            self.data
                 .get(key)
                 .map(|locked_entry| {
                     *locked_entry.lock().unwrap() = StoreEntry::new(value, ttl);
@@ -646,7 +648,9 @@ mod inner_map {
             Q: Hash + Eq + ?Sized,
         {
             // TODO deal with a poisoned mutex
-            self.0.get(key).map(|entry| (entry.lock().unwrap()).clone())
+            self.data
+                .get(key)
+                .map(|entry| (entry.lock().unwrap()).clone())
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -655,7 +659,7 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.0.remove(key).is_some()
+            self.data.remove(key).is_some()
         }
 
         // TODO ttl?
@@ -667,7 +671,7 @@ mod inner_map {
             E: ?Sized,
             V: PartialEq<E>,
         {
-            self.0.get(key).map(|locked_entry| {
+            self.data.get(key).map(|locked_entry| {
                 let mut entry = locked_entry.lock().unwrap();
                 if entry.value == *expected {
                     entry.update_value(new);
@@ -684,10 +688,10 @@ mod inner_map {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            let expires = { self.0.get(key)?.lock().unwrap().expires? };
+            let expires = { self.data.get(key)?.lock().unwrap().expires? };
 
             if expires < Instant::now() {
-                self.0.remove(key);
+                self.data.remove(key);
             }
 
             None
