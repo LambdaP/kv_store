@@ -611,8 +611,19 @@ mod inner_map {
         // Returns whether the key was present
         #[tracing::instrument(level = "trace", skip(self, key, value))]
         pub fn insert(&mut self, key: K, value: V, ttl: Option<Duration>) -> bool {
-            let entry = StoreEntry::new(value, ttl);
-            self.0.insert(key, entry.into()).is_some()
+            use std::collections::hash_map::Entry;
+
+            let new_entry = StoreEntry::new(value, ttl);
+            match self.0.entry(key) {
+                Entry::Occupied(o) => {
+                    *o.get().lock().unwrap() = new_entry;
+                    true
+                }
+                Entry::Vacant(o) => {
+                    o.insert(Mutex::new(new_entry));
+                    false
+                }
+            }
         }
 
         pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> bool
