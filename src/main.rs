@@ -703,32 +703,24 @@ mod inner_map {
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
-        pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> bool
+        pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> Result<u64, bool>
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
             let expires = {
-                let Some(locked_entry) = self.data.get(key) else {
-                    return false;
-                };
-
+                let locked_entry = self.data.get(key).ok_or(false)?;
                 let guard = locked_entry.lock().unwrap();
-
-                let Some(expires) = guard.expires else {
-                    return false;
-                };
-
-                expires
+                guard.expires.ok_or(true)?
             };
 
             if expires > Instant::now() {
-                return false;
+                return Err(true);
             }
 
             self.data.remove(key);
-            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
-            true
+            let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            Ok(op_rank)
         }
     }
 
@@ -818,7 +810,7 @@ mod inner_map {
             // Sleep to ensure the entry expires
             std::thread::sleep(Duration::from_millis(1));
 
-            map.remove_if_outdated("key6");
+            _ = map.remove_if_outdated("key6");
             assert!(map.get("key6").is_none());
         }
 
