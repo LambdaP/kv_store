@@ -86,10 +86,11 @@ mod store_interface {
         response::{IntoResponse, Response},
     };
     use std::{
+        collections::HashMap,
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::{broadcast, mpsc, RwLock};
     use tracing::{debug, info};
 
     use crate::utf8_bytes::Utf8Bytes;
@@ -109,10 +110,14 @@ mod store_interface {
         }
     }
 
+    type PubHandle = broadcast::Sender<(u64, Utf8Bytes)>;
+
     // TODO use a BTreeMap to store keys ordered by expiry date
+    // TODO implement pub/sub to keys using a tokio::sync::broadcast channel
     #[derive(Debug)]
     pub struct KvStore {
         pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
+        pub publish_handles: RwLock<HashMap<String, PubHandle>>,
         pub metrics: Metrics,
         keys_removal_tx: mpsc::Sender<String>,
     }
@@ -238,6 +243,7 @@ mod store_interface {
         pub fn new(tx: mpsc::Sender<String>) -> KvStore {
             KvStore {
                 data: RwLock::default(),
+                publish_handles: RwLock::default(),
                 metrics: Metrics::new(),
                 keys_removal_tx: tx,
             }
@@ -260,21 +266,25 @@ mod store_interface {
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
             self.metrics.increment_put();
-            if self
-                .data
-                .read()
-                .await
-                .try_swap(&key, value.clone(), ttl)
-                .is_some()
-            {
+            let pub_tx = { self.publish_handles.read().await.get(&key).cloned() };
+
+            // If the key is already present,
+            //   acquire the lock with `read()`
+            //   and update the entry using inner mutability.
+            if let Some(cnt) = self.data.read().await.try_swap(&key, value.clone(), ttl) {
+                pub_tx.map(|tx| tx.send((cnt, value)));
                 return KvStoreResponse::Success;
             }
 
-            if self.data.write().await.insert(key, value, ttl).1 {
-                return KvStoreResponse::Success;
-            }
+            let (cnt, key_exists) = self.data.write().await.insert(key, value.clone(), ttl);
 
-            KvStoreResponse::Created
+            pub_tx.map(|tx| tx.send((cnt, value)));
+
+            if key_exists {
+                KvStoreResponse::Success
+            } else {
+                KvStoreResponse::Created
+            }
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
