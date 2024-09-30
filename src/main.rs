@@ -290,7 +290,7 @@ mod store_interface {
             debug!("Removing key: {}", key);
             self.metrics.increment_delete();
 
-            if self.data.write().await.remove(key) {
+            if self.data.write().await.remove(key).is_some() {
                 KvStoreResponse::Success
             } else {
                 KvStoreResponse::NotFound
@@ -667,17 +667,15 @@ mod inner_map {
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
-        pub fn remove<Q>(&mut self, key: &Q) -> bool
+        pub fn remove<Q>(&mut self, key: &Q) -> Option<u64>
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            let Some(_) = self.data.remove(key) else {
-                return false;
-            };
+            self.data.remove(key)?;
 
-            let _op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
-            true
+            let op_rank = self.mut_count.fetch_add(1, Ordering::Relaxed);
+            Some(op_rank)
         }
 
         // TODO ttl?
@@ -772,7 +770,7 @@ mod inner_map {
         fn test_remove() {
             let mut map = InnerMap::<String, Utf8Bytes>::default();
             map.insert("key3".into(), "value3".into(), None);
-            assert!(map.remove("key3"));
+            assert!(map.remove("key3").is_some());
             assert_eq!(map.len(), 0);
             assert!(map.get("key3").is_none());
         }
@@ -828,7 +826,7 @@ mod inner_map {
         fn test_non_existent_key() {
             let mut map = InnerMap::<String, Utf8Bytes>::default();
             assert!(map.get("non_existent").is_none());
-            assert!(!map.remove("non_existent"));
+            assert!(map.remove("non_existent").is_none());
             assert_eq!(
                 map.compare_and_swap("non_existent", "any", "new".into()),
                 None
