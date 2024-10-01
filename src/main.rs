@@ -381,11 +381,30 @@ mod store_interface {
             buf: &mut Vec<String>,
         ) {
             rx.recv_many(buf, rx.max_capacity()).await;
-            let mut store = self.data.write().await;
-            buf.drain(..).for_each(|key| {
-                // TODO notify subscribers for each key
-                _ = store.remove_if_outdated(&key);
-            });
+
+            let removed_keys = {
+                let mut guard = self.data.write().await;
+
+                // TODO if I'm reusing a buffer for recv,
+                //   I should also reuse a buffer here.
+                buf.drain(..)
+                    .filter_map(|key| {
+                        if let Ok(cnt) = guard.remove_if_outdated(&key) {
+                            Some((key, cnt))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let guard = self.publish_handles.read().await;
+
+            for (key, cnt) in removed_keys {
+                if let Some(tx) = guard.get(&key) {
+                    _ = tx.send((cnt, "".into())); // TODO fix API to mention command name
+                }
+            }
         }
     }
 
