@@ -65,6 +65,7 @@ async fn main() {
         .route("/store/:key", put(routes::put_key_val))
         .route("/store/:key", delete(routes::delete_key))
         .route("/store/cas/:key", post(routes::compare_and_swap))
+        .route("/watch/:key", get(routes::watch_keys))
         .route("/batch", post(routes::batch_process))
         .route("/status", get(routes::status))
         .layer(GovernorLayer {
@@ -110,8 +111,9 @@ mod store_interface {
         }
     }
 
+    #[non_exhaustive]
     #[derive(Debug, Copy, Clone)]
-    enum Cmd {
+    pub(crate) enum Cmd {
         Get,
         Put,
         Delete,
@@ -120,6 +122,7 @@ mod store_interface {
     }
 
     type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
+    type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
 
     // TODO use a BTreeMap to store keys ordered by expiry date
     // TODO implement pub/sub to keys using a tokio::sync::broadcast channel
@@ -259,8 +262,17 @@ mod store_interface {
             }
         }
 
-        async fn get_pub_tx(&self, key: &str) -> Option<PubHandle> {
+        pub(crate) async fn get_pub_tx(&self, key: &str) -> Option<PubHandle> {
             self.publish_handles.read().await.get(key).cloned()
+        }
+
+        pub(crate) async fn create_pub_tx(&self, key: String) -> PubHandle {
+            self.publish_handles
+                .write()
+                .await
+                .entry(key)
+                .or_insert_with(|| broadcast::channel(1024).0)
+                .clone()
         }
 
         // TODO Tokio prioritises writer access on RwStores
@@ -286,6 +298,9 @@ mod store_interface {
             //   acquire the lock with `read()`
             //   and update the entry using inner mutability.
             if let Some(cnt) = self.data.read().await.try_swap(&key, value.clone(), ttl) {
+                // TODO this reports a change
+                //   even if the new value is the same as before.
+                // Fix this.
                 if let Some(tx) = pub_tx {
                     _ = tx.send((Cmd::Put, cnt, value));
                 }
@@ -715,6 +730,12 @@ mod inner_map {
             }
         }
 
+        // TODO this shouldn't count as a change
+        //   if the value hasn't actually changed.
+        // This also raises the question of changes wrt the TTL.
+        // If I'm inserting the same value with a different TTL,
+        //   which takes priority?
+        // A sane default would be whichever ends last, maybe
         pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> Option<u64>
         where
             K: Borrow<Q>,
@@ -1179,6 +1200,49 @@ mod routes {
         kv_store
             .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
             .await
+    }
+
+    pub async fn watch_keys(
+        State(kv_store): State<Arc<KvStore>>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
+        use crate::store_interface::Cmd;
+
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+
+        let sub_rx = if let Some(tx) = kv_store.get_pub_tx(&key).await {
+            tx
+        } else {
+            kv_store.create_pub_tx(key.clone()).await
+        }
+        .subscribe();
+
+        // TODO communicate initial value or lack thereof
+
+        // TODO consider throttling
+        let sub_stream = BroadcastStream::new(sub_rx).map(move |msg| {
+            msg.map(|(cmd, cnt, body)| {
+                // TODO escape `body`
+                //   so that it doesn't contain carriage returns,
+                //   as those cannot be transmitted
+                //   newlines should also be escaped,
+                //   and maybe more stuff
+                //   alternatively, use `json_data()`
+                Event::default()
+                    .data(body)
+                    .event(match cmd {
+                        Cmd::Put => format!("PUT key {key}"),
+                        Cmd::Delete => format!("DEL key {key}"),
+                        Cmd::CompareAndSwap => format!("CAS key {key}"),
+                        Cmd::Expired => format!("EXP key {key}"),
+                        _ => unreachable!(),
+                    })
+                    .id(cnt.to_string())
+            })
+        });
+
+        Sse::new(sub_stream).keep_alive(KeepAlive::default())
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store, requests))]
