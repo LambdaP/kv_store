@@ -1218,7 +1218,16 @@ mod routes {
         }
         .subscribe();
 
-        // TODO communicate initial value or lack thereof
+        let first_event = if let Some(inner_map::StoreEntry { value, .. }) =
+            kv_store.data.read().await.get(&key)
+        {
+            Event::default().data(value)
+        } else {
+            Event::default()
+        }
+        .event(format!("WATCH key {key}"));
+
+        let first_msg = tokio_stream::once(Ok(first_event));
 
         // TODO consider throttling
         let sub_stream = BroadcastStream::new(sub_rx).map(move |msg| {
@@ -1233,16 +1242,18 @@ mod routes {
                     .data(body)
                     .event(match cmd {
                         Cmd::Put => format!("PUT key {key}"),
-                        Cmd::Delete => format!("DEL key {key}"),
+                        Cmd::Delete => format!("DELETE key {key}"),
                         Cmd::CompareAndSwap => format!("CAS key {key}"),
-                        Cmd::Expired => format!("EXP key {key}"),
+                        Cmd::Expired => format!("EXPIRED key {key}"),
                         _ => unreachable!(),
                     })
                     .id(cnt.to_string())
             })
         });
 
-        Sse::new(sub_stream).keep_alive(KeepAlive::default())
+        let response_stream = first_msg.chain(sub_stream);
+
+        Sse::new(response_stream).keep_alive(KeepAlive::default())
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store, requests))]
