@@ -114,6 +114,7 @@ mod store_interface {
 
     // TODO use a BTreeMap to store keys ordered by expiry date
     // TODO implement pub/sub to keys using a tokio::sync::broadcast channel
+    // TODO make sure I don't have deadlocks with the two locked structures
     #[derive(Debug)]
     pub struct KvStore {
         pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
@@ -249,6 +250,10 @@ mod store_interface {
             }
         }
 
+        async fn get_pub_tx(&self, key: &str) -> Option<PubHandle> {
+            self.publish_handles.read().await.get(key).cloned()
+        }
+
         // TODO Tokio prioritises writer access on RwStores
         //   to avoid the case of readers starving writers.
         // Here and in other places,
@@ -266,19 +271,23 @@ mod store_interface {
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
             self.metrics.increment_put();
-            let pub_tx = { self.publish_handles.read().await.get(&key).cloned() };
+            let pub_tx = self.get_pub_tx(&key).await;
 
             // If the key is already present,
             //   acquire the lock with `read()`
             //   and update the entry using inner mutability.
             if let Some(cnt) = self.data.read().await.try_swap(&key, value.clone(), ttl) {
-                pub_tx.map(|tx| tx.send((cnt, value)));
+                if let Some(tx) = pub_tx {
+                    _ = tx.send((cnt, value));
+                }
                 return KvStoreResponse::Success;
             }
 
             let (cnt, key_exists) = self.data.write().await.insert(key, value.clone(), ttl);
 
-            pub_tx.map(|tx| tx.send((cnt, value)));
+            if let Some(tx) = pub_tx {
+                _ = tx.send((cnt, value));
+            }
 
             if key_exists {
                 KvStoreResponse::Success
@@ -311,11 +320,15 @@ mod store_interface {
             debug!("Removing key: {}", key);
             self.metrics.increment_delete();
 
-            if self.data.write().await.remove(key).is_some() {
-                KvStoreResponse::Success
-            } else {
-                KvStoreResponse::NotFound
+            let Some(cnt) = self.data.write().await.remove(key) else {
+                return KvStoreResponse::NotFound;
+            };
+
+            if let Some(tx) = self.get_pub_tx(key).await {
+                _ = tx.send((cnt, "".into())); // TODO fix API to mention command name
             }
+
+            KvStoreResponse::Success
         }
 
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
@@ -330,14 +343,23 @@ mod store_interface {
             Utf8Bytes: PartialEq<E>,
         {
             debug!("Compare-and-swap on key: {}", key);
-            match self.data.read().await.compare_and_swap(key, expected, new) {
-                Ok(_) => {
+            match self
+                .data
+                .read()
+                .await
+                .compare_and_swap(key, expected, new.clone())
+            {
+                Ok(cnt) => {
                     self.metrics.increment_cas_success();
+                    if let Some(tx) = self.get_pub_tx(key).await {
+                        _ = tx.send((cnt, new)); // TODO fix API to mention command name
+                    }
                     KvStoreResponse::Success
                 }
                 Err(key_was_there) => {
                     self.metrics.increment_cas_failure();
                     if key_was_there {
+                        // TODO should I notify subscribers here as well?
                         KvStoreResponse::CasTestFailed
                     } else {
                         KvStoreResponse::NotFound
@@ -361,6 +383,7 @@ mod store_interface {
             rx.recv_many(buf, rx.max_capacity()).await;
             let mut store = self.data.write().await;
             buf.drain(..).for_each(|key| {
+                // TODO notify subscribers for each key
                 _ = store.remove_if_outdated(&key);
             });
         }
