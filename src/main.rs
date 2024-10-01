@@ -110,7 +110,16 @@ mod store_interface {
         }
     }
 
-    type PubHandle = broadcast::Sender<(u64, Utf8Bytes)>;
+    #[derive(Debug, Copy, Clone)]
+    enum Cmd {
+        Get,
+        Put,
+        Delete,
+        CompareAndSwap,
+        Expired,
+    }
+
+    type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
 
     // TODO use a BTreeMap to store keys ordered by expiry date
     // TODO implement pub/sub to keys using a tokio::sync::broadcast channel
@@ -278,7 +287,7 @@ mod store_interface {
             //   and update the entry using inner mutability.
             if let Some(cnt) = self.data.read().await.try_swap(&key, value.clone(), ttl) {
                 if let Some(tx) = pub_tx {
-                    _ = tx.send((cnt, value));
+                    _ = tx.send((Cmd::Put, cnt, value));
                 }
                 return KvStoreResponse::Success;
             }
@@ -286,7 +295,8 @@ mod store_interface {
             let (cnt, key_exists) = self.data.write().await.insert(key, value.clone(), ttl);
 
             if let Some(tx) = pub_tx {
-                _ = tx.send((cnt, value));
+                // TODO consider using a different Cmd here to signal Update
+                _ = tx.send((Cmd::Put, cnt, value));
             }
 
             if key_exists {
@@ -325,7 +335,7 @@ mod store_interface {
             };
 
             if let Some(tx) = self.get_pub_tx(key).await {
-                _ = tx.send((cnt, "".into())); // TODO fix API to mention command name
+                _ = tx.send((Cmd::Delete, cnt, "".into()));
             }
 
             KvStoreResponse::Success
@@ -352,7 +362,7 @@ mod store_interface {
                 Ok(cnt) => {
                     self.metrics.increment_cas_success();
                     if let Some(tx) = self.get_pub_tx(key).await {
-                        _ = tx.send((cnt, new)); // TODO fix API to mention command name
+                        _ = tx.send((Cmd::CompareAndSwap, cnt, new));
                     }
                     KvStoreResponse::Success
                 }
@@ -402,7 +412,7 @@ mod store_interface {
 
             for (key, cnt) in removed_keys {
                 if let Some(tx) = guard.get(&key) {
-                    _ = tx.send((cnt, "".into())); // TODO fix API to mention command name
+                    _ = tx.send((Cmd::Expired, cnt, "".into()));
                 }
             }
         }
