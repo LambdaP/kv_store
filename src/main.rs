@@ -133,6 +133,7 @@ mod store_interface {
         keys_removal_tx: mpsc::Sender<String>,
     }
 
+    #[non_exhaustive]
     #[derive(Clone, Debug)]
     pub enum KvStoreResponse {
         Success,
@@ -319,6 +320,7 @@ mod store_interface {
             }
         }
 
+        // TODO communicate TTL so that it can be part of the response
         #[tracing::instrument(level = "trace", skip(self, key))]
         pub async fn get(&self, key: &str) -> KvStoreResponse {
             debug!("Getting key: {}", key);
@@ -772,6 +774,7 @@ mod inner_map {
         }
 
         // TODO ttl?
+        // TODO replace bool with enum to clarify API
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
         pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Result<u64, bool>
         where
@@ -794,6 +797,7 @@ mod inner_map {
             Ok(op_rank)
         }
 
+        // TODO replace bool with enum to clarify API
         #[tracing::instrument(level = "trace", skip(self, key))]
         pub fn remove_if_outdated<Q>(&mut self, key: &Q) -> Result<u64, bool>
         where
@@ -1159,6 +1163,7 @@ mod routes {
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, Instant};
     use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
+    use tokio_stream::StreamExt;
 
     use crate::utf8_bytes::Utf8Bytes;
 
@@ -1252,6 +1257,8 @@ mod routes {
             .await
     }
 
+    // TODO allow for watching multiple keys
+    #[tracing::instrument(level = "trace", skip(kv_store))]
     pub async fn watch_keys(
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
@@ -1414,6 +1421,7 @@ mod routes {
                 .route("/store/:key", put(put_key_val))
                 .route("/store/:key", delete(delete_key))
                 .route("/store/cas/:key", post(compare_and_swap))
+                .route("/watch/:key", get(routes::watch_keys))
                 .route("/batch", post(batch_process))
                 .route("/status", get(status))
                 .with_state(kv_store)
@@ -1601,6 +1609,73 @@ mod routes {
                 .await
                 .unwrap();
             assert!(body.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_watch_single_key() {
+            let app = setup_app().await;
+            let key = "test_watch_key";
+
+            // Start watching the key
+            let watch_request = Request::builder()
+                .method("GET")
+                .uri(format!("/watch/{}", key))
+                .body(Body::empty())
+                .unwrap();
+
+            let watch_response = app.clone().oneshot(watch_request).await.unwrap();
+            assert_eq!(watch_response.status(), StatusCode::OK);
+
+            // Convert the response body into a stream of events
+            let mut body_stream = watch_response.into_body().into_data_stream();
+
+            // Check the initial SSE
+            let chunk = body_stream
+                .next()
+                .await
+                .expect("Expected initial WATCH event, but none was received")
+                .unwrap();
+            let event = std::str::from_utf8(&chunk).unwrap();
+
+            assert!(
+                event.contains(&format!("event: WATCH key {}", key)),
+                "Expected initial WATCH event, got: {}",
+                event
+            );
+
+            // Perform operations on the key
+            let operations = vec![
+                ("PUT", "initial_value", StatusCode::CREATED),
+                ("PUT", "updated_value", StatusCode::NO_CONTENT),
+                ("DELETE", "", StatusCode::NO_CONTENT),
+            ];
+
+            for (operation, value, expected_code) in operations {
+                let request = match operation {
+                    "PUT" => Request::builder()
+                        .method("PUT")
+                        .uri(format!("/store/{}", key))
+                        .body(Body::from(value.to_string()))
+                        .unwrap(),
+                    "DELETE" => Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/store/{}", key))
+                        .body(Body::empty())
+                        .unwrap(),
+                    _ => panic!("Unsupported operation"),
+                };
+
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), expected_code);
+
+                let chunk = body_stream.next().await.unwrap().unwrap();
+
+                let event = std::str::from_utf8(&chunk).unwrap();
+                assert!(event.contains(&format!("event: {} key {}", operation, key)));
+                if operation == "PUT" {
+                    assert!(event.contains(value));
+                }
+            }
         }
     }
 }
