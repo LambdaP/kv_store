@@ -11,8 +11,6 @@ use axum::{
 
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
-use bytes::Bytes;
-
 use tracing::{error, info};
 
 use crate::store_interface::KvStore;
@@ -1078,7 +1076,7 @@ mod utf8_bytes {
     mod serde {
         use super::Utf8Bytes;
         use bytes::Bytes;
-        pub(super) use serde::{Deserialize, Deserializer, Serialize, Serializer};
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
         impl<'de> Deserialize<'de> for Utf8Bytes {
             fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
@@ -1098,6 +1096,50 @@ mod utf8_bytes {
                 S: Serializer,
             {
                 serializer.serialize_str(self)
+            }
+        }
+    }
+
+    mod axum {
+        use super::Utf8Bytes;
+        use axum::{async_trait, extract::Request, http::StatusCode, response::IntoResponse};
+        use bytes::Bytes;
+
+        #[async_trait]
+        impl<S> axum::extract::FromRequest<S> for Utf8Bytes
+        where
+            S: Send + Sync,
+        {
+            type Rejection = (StatusCode, String);
+
+            #[tracing::instrument(level = "trace", skip(req, state))]
+            async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+                let body = Bytes::from_request(req, state)
+                    .await
+                    .map_err(|err| (err.status(), err.body_text()))?;
+
+                body.try_into().map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Request body didn't contain valid UTF-8".into(),
+                    )
+                })
+            }
+        }
+
+        impl IntoResponse for Utf8Bytes {
+            #[tracing::instrument(level = "trace", skip(self))]
+            fn into_response(self) -> axum::response::Response {
+                // String::from(&*self).into_response()
+                use axum::{body::Body, http::header};
+
+                const TEXT_PLAIN_UTF_8: &str = "text/plain; charset=utf-8";
+                const HEADER_VALUE: header::HeaderValue =
+                    header::HeaderValue::from_static(TEXT_PLAIN_UTF_8);
+
+                let mut res = Body::from(Bytes::from(self)).into_response();
+                res.headers_mut().insert(header::CONTENT_TYPE, HEADER_VALUE);
+                res
             }
         }
     }
@@ -1348,48 +1390,6 @@ mod routes {
             total_operations,
             server_time,
             version,
-        }
-    }
-
-    // This should live somewhere else
-    use axum::async_trait;
-    use axum::extract::Request;
-
-    #[async_trait]
-    impl<S> axum::extract::FromRequest<S> for Utf8Bytes
-    where
-        S: Send + Sync,
-    {
-        type Rejection = (StatusCode, String);
-
-        #[tracing::instrument(level = "trace", skip(req, state))]
-        async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-            let body = Bytes::from_request(req, state)
-                .await
-                .map_err(|err| (err.status(), err.body_text()))?;
-
-            body.try_into().map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Request body didn't contain valid UTF-8".into(),
-                )
-            })
-        }
-    }
-
-    impl IntoResponse for Utf8Bytes {
-        #[tracing::instrument(level = "trace", skip(self))]
-        fn into_response(self) -> axum::response::Response {
-            // String::from(&*self).into_response()
-            use axum::{body::Body, http::header};
-
-            const TEXT_PLAIN_UTF_8: &str = "text/plain; charset=utf-8";
-            const HEADER_VALUE: header::HeaderValue =
-                header::HeaderValue::from_static(TEXT_PLAIN_UTF_8);
-
-            let mut res = Body::from(Bytes::from(self)).into_response();
-            res.headers_mut().insert(header::CONTENT_TYPE, HEADER_VALUE);
-            res
         }
     }
 
