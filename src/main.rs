@@ -945,8 +945,6 @@ mod inner_map {
 
 mod utf8_bytes {
     use bytes::Bytes;
-    use serde::{Deserialize, Deserializer};
-    use serde::{Serialize, Serializer};
     use std::ops::Deref;
     use std::str::Utf8Error;
 
@@ -1077,27 +1075,37 @@ mod utf8_bytes {
         }
     }
 
-    impl<'de> Deserialize<'de> for Utf8Bytes {
-        fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            use serde::de::Error;
-            Bytes::deserialize(deserializer)?
-                .try_into()
-                .map_err(Error::custom)
-        }
-    }
+    mod serde {
+        use super::Utf8Bytes;
+        use bytes::Bytes;
+        pub(super) use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    impl Serialize for Utf8Bytes {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_str(self)
+        impl<'de> Deserialize<'de> for Utf8Bytes {
+            fn deserialize<D>(deserializer: D) -> Result<Utf8Bytes, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                use serde::de::Error;
+                Bytes::deserialize(deserializer)?
+                    .try_into()
+                    .map_err(Error::custom)
+            }
+        }
+
+        impl Serialize for Utf8Bytes {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self)
+            }
         }
     }
 }
+
+// TODO most responses here
+//   should probably include "Cache-Control: no-cache"
+//   as a header
 mod routes {
     #[allow(clippy::wildcard_imports)]
     use super::*;
