@@ -1,8 +1,11 @@
 use std::env;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
+use std::future::IntoFuture;
 
-use tokio::sync::mpsc;
+use tokio::signal;
+use tokio::sync::{oneshot, mpsc};
+use tokio::time::{timeout, Duration};
 
 use axum::{
     routing::{delete, get, post, put},
@@ -11,7 +14,7 @@ use axum::{
 
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::store_interface::KvStore;
 
@@ -44,19 +47,48 @@ async fn main() {
 
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
 
-    let kv_store = Arc::new(KvStore::new(tx));
+    let (cleanup_tx, mut cleanup_rx) = mpsc::channel(64);
+
+    let kv_store = Arc::new(KvStore::new(cleanup_tx));
     let cleanup_store = kv_store.clone();
 
-    tokio::spawn(async move {
-        let mut buf = vec![];
-        loop {
-            cleanup_store.cleanup_received_keys(&mut rx, &mut buf).await;
+    let cleanup_task = tokio::spawn({
+        async move {
+            let mut buf = vec![];
+            loop {
+                tokio::select! {
+                    () = cleanup_store.cleanup_received_keys(&mut cleanup_rx, &mut buf) => {},
+                    _ = &mut cleanup_shutdown_rx => {
+                    info!("Cleanup task received shutdown signal");
+                    break;
+                    },
+                }
+            }
         }
     });
 
-    let governor_config = Arc::new(GovernorConfig::default());
+    let shutdown_future = {
+        async move {
+            let ctrl_c = async { signal::ctrl_c().await.unwrap() };
+
+            let terminate = async {
+                signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .unwrap()
+                    .recv()
+                    .await;
+            };
+
+            tokio::select! {
+                () = ctrl_c => {},
+                () = terminate => {},
+            }
+
+            info!("Shutdown signal received");
+        }
+    };
 
     let app = Router::new()
         .route("/store/:key", get(routes::get_key))
@@ -65,17 +97,58 @@ async fn main() {
         .route("/store/cas/:key", post(routes::compare_and_swap))
         .route("/watch/:key", get(routes::watch_keys))
         .route("/batch", post(routes::batch_process))
-        .route("/status", get(routes::status))
-        .layer(GovernorLayer {
-            config: governor_config,
-        })
-        .with_state(kv_store)
-        // The following is required
-        //   for the Governor layer to work properly.
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        .route("/status", get(routes::status));
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    let server = axum::serve(
+        listener,
+        app.with_state(kv_store.clone())
+            .layer(GovernorLayer {
+                config: Arc::new(GovernorConfig::default()),
+            })
+            // The following is required
+            //   for the Governor layer to work properly.
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+            _ = server_shutdown_rx.await;
+        });
+
+    let server_task = tokio::spawn(server.into_future());
+
+    () = shutdown_future.await;
+
+    info!("Initiating server shutdown");
+
+    _ = server_shutdown_tx.send(());
+    _ = cleanup_shutdown_tx.send(());
+
+    kv_store.close_publish_handles().await;
+
+    match timeout(Duration::from_secs(30), server_task).await {
+        Ok(res) => {
+            if let Err(e) = res {
+                error!("Server error: {}", e);
+            }
+        }
+        _ => {
+            warn!("Server shutdown timed out after 30 seconds");
+        }
+    }
+
+    match timeout(Duration::from_secs(10), cleanup_task).await {
+        Ok(res) => {
+            if let Err(e) = res {
+                error!("Cleanup task error: {}", e);
+            }
+        }
+        _ => {
+            warn!("Cleanup task shutdown timed out after 10 seconds");
+        }
+    }
+
+    info!("Server shutdown complete");
 }
 
 mod store_interface {
@@ -430,6 +503,12 @@ mod store_interface {
                     _ = tx.send((Cmd::Expired, cnt, "".into()));
                 }
             }
+        }
+
+        pub async fn close_publish_handles(&self) {
+            // TODO maybe send a termination message
+            let mut guard = self.publish_handles.write().await;
+            _ = std::mem::take(&mut *guard);
         }
     }
 
@@ -1163,7 +1242,6 @@ mod routes {
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, Instant};
     use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
-    use tokio_stream::StreamExt;
 
     use crate::utf8_bytes::Utf8Bytes;
 
