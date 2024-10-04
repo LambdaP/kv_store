@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 
 use tokio::signal;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
 use axum::{
@@ -33,26 +33,42 @@ async fn main() {
     let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
     let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
 
-    let (cleanup_tx, mut cleanup_rx) = mpsc::channel(64);
-
     // TODO the creation of the cleanup task is a bit messy atm
-    let kv_store = Arc::new(KvStore::new(cleanup_tx));
+    let kv_store = Arc::new(KvStore::new());
     let cleanup_store = kv_store.clone();
 
     let cleanup_task = tokio::spawn({
         async move {
-            let mut buf = vec![];
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+
             loop {
+                interval.tick().await;
                 tokio::select! {
-                    () = cleanup_store.cleanup_received_keys(&mut cleanup_rx, &mut buf) => {},
+                    () = cleanup_store.cleanup_marked_keys() => {},
                     _ = &mut cleanup_shutdown_rx => {
                     info!("Cleanup task received shutdown signal");
                     break;
                     },
                 }
             }
+
         }
     });
+
+    // let cleanup_task = tokio::spawn({
+    //     async move {
+    //         let mut buf = vec![];
+    //         loop {
+    //             tokio::select! {
+    //                 () = cleanup_store.cleanup_received_keys(&mut cleanup_rx, &mut buf) => {},
+    //                 _ = &mut cleanup_shutdown_rx => {
+    //                 info!("Cleanup task received shutdown signal");
+    //                 break;
+    //                 },
+    //             }
+    //         }
+    //     }
+    // });
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
 
@@ -171,7 +187,7 @@ mod store_interface {
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
-    use tokio::sync::{broadcast, mpsc, RwLock};
+    use tokio::sync::{broadcast, RwLock};
     use tracing::{debug, info};
 
     use crate::utf8_bytes::Utf8Bytes;
@@ -212,7 +228,7 @@ mod store_interface {
         pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
         pub publish_handles: RwLock<HashMap<String, PubHandle>>,
         pub metrics: Metrics,
-        keys_removal_tx: mpsc::Sender<String>,
+        keys_to_remove: std::sync::Mutex<Vec<String>>,
     }
 
     #[non_exhaustive]
@@ -333,13 +349,13 @@ mod store_interface {
     }
 
     impl KvStore {
-        #[tracing::instrument(level = "trace", skip(tx))]
-        pub fn new(tx: mpsc::Sender<String>) -> KvStore {
+        #[tracing::instrument(level = "trace", skip())]
+        pub fn new() -> KvStore {
             KvStore {
                 data: RwLock::default(),
                 publish_handles: RwLock::default(),
                 metrics: Metrics::new(),
-                keys_removal_tx: tx,
+                keys_to_remove: std::sync::Mutex::default(),
             }
         }
 
@@ -487,23 +503,31 @@ mod store_interface {
         #[tracing::instrument(level = "trace", skip(self))]
         fn mark_key_for_removal(&self, key: &str) -> bool {
             info!("Marking key {} for removal", key);
-            self.keys_removal_tx.try_send(key.into()).is_ok()
+            // self.keys_removal_tx.try_send(key.into()).is_ok()
+            if let Ok(ref mut buf) = self.keys_to_remove.try_lock() {
+                buf.push(String::from(key));
+                return true;
+            }
+            false
         }
 
-        #[tracing::instrument(level = "trace", skip(self, rx, buf))]
-        pub async fn cleanup_received_keys(
-            &self,
-            rx: &mut mpsc::Receiver<String>,
-            buf: &mut Vec<String>,
-        ) {
-            rx.recv_many(buf, rx.max_capacity()).await;
+        fn take_keys_to_remove(&self) -> Vec<String> {
+            let mut guard = self.keys_to_remove.lock().unwrap();
+            std::mem::take(&mut *guard)
+        }
 
-            let removed_keys = {
+        pub async fn cleanup_marked_keys(&self) {
+            let keys = self.take_keys_to_remove();
+
+            if keys.len() == 0 {
+                return;
+            }
+
+            let removed: Vec<_> = {
                 let mut guard = self.data.write().await;
 
-                // TODO if I'm reusing a buffer for recv,
-                //   I should also reuse a buffer here.
-                buf.drain(..)
+                keys
+                    .into_iter()
                     .filter_map(|key| {
                         if let Ok(cnt) = guard.remove_if_outdated(&key) {
                             Some((key, cnt))
@@ -511,16 +535,21 @@ mod store_interface {
                             None
                         }
                     })
-                    .collect::<Vec<_>>()
+                    .collect()
             };
+
+            if removed.len() == 0 {
+                return;
+            }
 
             let guard = self.publish_handles.read().await;
 
-            for (key, cnt) in removed_keys {
+            for (key, cnt) in removed {
                 if let Some(tx) = guard.get(&key) {
                     _ = tx.send((Cmd::Expired, cnt, "".into()));
                 }
             }
+
         }
 
         pub async fn close_publish_handles(&self) {
@@ -535,12 +564,10 @@ mod store_interface {
         use super::*;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         #[tracing::instrument(level = "trace", skip())]
         async fn setup_kvstore() -> KvStore {
-            let (tx, _rx) = mpsc::channel(64);
-            KvStore::new(tx)
+            KvStore::new()
         }
 
         #[tokio::test]
@@ -641,8 +668,7 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_metrics_accuracy() {
-            let (tx, _) = mpsc::channel(64);
-            let store = Arc::new(KvStore::new(tx));
+            let store = Arc::new(KvStore::new());
             let key = "key1";
 
             // Perform a series of operations
@@ -661,9 +687,8 @@ mod store_interface {
         }
 
         #[tokio::test]
-        async fn test_cleanup_received_keys() {
-            let (tx, mut rx) = mpsc::channel(64);
-            let store = Arc::new(KvStore::new(tx));
+        async fn test_cleanup_marked_keys() {
+            let store = Arc::new(KvStore::new());
             let key = "cleanup_key";
             let value = "cleanup_value";
 
@@ -679,8 +704,7 @@ mod store_interface {
             let _ = store.get(&key).await;
 
             // Run the cleanup
-            let mut buf = Vec::new();
-            store.cleanup_received_keys(&mut rx, &mut buf).await;
+            store.cleanup_marked_keys().await;
 
             // The key should now be removed
             let get_result = store.get(&key).await;
@@ -1505,13 +1529,11 @@ mod routes {
             Router,
         };
         use std::sync::Arc;
-        use tokio::sync::mpsc;
         use tower::ServiceExt; // for `oneshot`
 
         #[tracing::instrument(level = "trace", skip())]
         async fn setup_app() -> Router {
-            let (tx, _rx) = mpsc::channel(64);
-            let kv_store = Arc::new(KvStore::new(tx));
+            let kv_store = Arc::new(KvStore::new());
             Router::new()
                 .route("/store/:key", get(get_key))
                 .route("/store/:key", put(put_key_val))
