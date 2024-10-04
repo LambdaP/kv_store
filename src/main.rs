@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::signal;
 use tokio::sync::oneshot;
-use tokio::time::{timeout, Duration};
+use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
 
 use axum::{
     routing::{delete, get, post, put},
@@ -29,48 +29,34 @@ async fn main() {
     let port = get_port_from_env().unwrap_or(DEFAULT_PORT);
 
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+
+    let kv_store = Arc::new(KvStore::new());
 
     let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
-    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
-
-    // TODO the creation of the cleanup task is a bit messy atm
-    let kv_store = Arc::new(KvStore::new());
-    let cleanup_store = kv_store.clone();
 
     let cleanup_task = tokio::spawn({
-        async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(10));
-
+        let cleanup_store = kv_store.clone();
+        let interval_cleanup = async move {
+            let mut interval = interval(Duration::from_millis(10));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                tokio::select! {
-                    () = cleanup_store.cleanup_marked_keys() => {},
-                    _ = &mut cleanup_shutdown_rx => {
-                    info!("Cleanup task received shutdown signal");
-                    break;
-                    },
-                }
+                cleanup_store.cleanup_marked_keys().await;
             }
+        };
 
+        async move {
+            tokio::select! {
+                () = interval_cleanup => {},
+                _ = &mut cleanup_shutdown_rx => {
+                info!("Cleanup task received shutdown signal");
+                },
+            }
         }
     });
 
-    // let cleanup_task = tokio::spawn({
-    //     async move {
-    //         let mut buf = vec![];
-    //         loop {
-    //             tokio::select! {
-    //                 () = cleanup_store.cleanup_received_keys(&mut cleanup_rx, &mut buf) => {},
-    //                 _ = &mut cleanup_shutdown_rx => {
-    //                 info!("Cleanup task received shutdown signal");
-    //                 break;
-    //                 },
-    //             }
-    //         }
-    //     }
-    // });
-
-    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
 
     let server = axum::serve(
         listener,
@@ -221,7 +207,6 @@ mod store_interface {
     type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
 
     // TODO use a BTreeMap to store keys ordered by expiry date
-    // TODO implement pub/sub to keys using a tokio::sync::broadcast channel
     // TODO make sure I don't have deadlocks with the two locked structures
     #[derive(Debug)]
     pub struct KvStore {
@@ -437,14 +422,6 @@ mod store_interface {
             }
 
             KvStoreResponse::SuccessBody(value)
-            //
-            // match expires {
-            //     Some(expires_at) if expires_at < Instant::now() => {
-            //         self.mark_key_for_removal(key);
-            //         KvStoreResponse::NotFound
-            //     }
-            //     _ => KvStoreResponse::SuccessBody(value),
-            // }
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -503,7 +480,6 @@ mod store_interface {
         #[tracing::instrument(level = "trace", skip(self))]
         fn mark_key_for_removal(&self, key: &str) -> bool {
             info!("Marking key {} for removal", key);
-            // self.keys_removal_tx.try_send(key.into()).is_ok()
             if let Ok(ref mut buf) = self.keys_to_remove.try_lock() {
                 buf.push(String::from(key));
                 return true;
@@ -519,15 +495,14 @@ mod store_interface {
         pub async fn cleanup_marked_keys(&self) {
             let keys = self.take_keys_to_remove();
 
-            if keys.len() == 0 {
+            if keys.is_empty() {
                 return;
             }
 
             let removed: Vec<_> = {
                 let mut guard = self.data.write().await;
 
-                keys
-                    .into_iter()
+                keys.into_iter()
                     .filter_map(|key| {
                         if let Ok(cnt) = guard.remove_if_outdated(&key) {
                             Some((key, cnt))
@@ -538,7 +513,7 @@ mod store_interface {
                     .collect()
             };
 
-            if removed.len() == 0 {
+            if removed.is_empty() {
                 return;
             }
 
@@ -549,7 +524,6 @@ mod store_interface {
                     _ = tx.send((Cmd::Expired, cnt, "".into()));
                 }
             }
-
         }
 
         pub async fn close_publish_handles(&self) {
