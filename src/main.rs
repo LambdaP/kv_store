@@ -139,7 +139,8 @@ fn make_app() -> Router<Arc<KvStore>> {
         .route("/store/:key", put(routes::put_key_val))
         .route("/store/:key", delete(routes::delete_key))
         .route("/store/cas/:key", post(routes::compare_and_swap))
-        .route("/watch/:key", get(routes::watch_keys))
+        .route("/watch_key/:key", get(routes::watch_key))
+        .route("/watch", post(routes::watch_multiple_keys))
         .route("/batch", post(routes::batch_process))
         .route("/status", get(routes::status))
 }
@@ -201,6 +202,13 @@ mod store_interface {
         Delete,
         CompareAndSwap,
         Expired,
+        Watch,
+    }
+
+    impl std::fmt::Display for Cmd {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "{}", format!("{self:?}").to_uppercase())
+        }
     }
 
     type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
@@ -1353,7 +1361,7 @@ mod routes {
 
     // TODO allow for watching multiple keys
     #[tracing::instrument(level = "trace", skip(kv_store))]
-    pub async fn watch_keys(
+    pub async fn watch_key(
         State(kv_store): State<Arc<KvStore>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
@@ -1405,6 +1413,69 @@ mod routes {
         let response_stream = first_msg.chain(sub_stream);
 
         Sse::new(response_stream).keep_alive(KeepAlive::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(kv_store))]
+    pub async fn watch_multiple_keys(
+        State(kv_store): State<Arc<KvStore>>,
+        Json(keys): Json<Vec<String>>,
+    ) -> impl IntoResponse {
+        use crate::store_interface::Cmd;
+
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
+
+        tracing::trace!("Watching multiple keys {keys:?}");
+
+        if keys.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let mut handles = vec![];
+
+        for key in &keys {
+            let key_pub_tx = if let Some(tx) = kv_store.get_pub_tx(key).await {
+                tx
+            } else {
+                kv_store.create_pub_tx(key.clone()).await
+            };
+
+            handles.push(key_pub_tx.subscribe());
+        }
+
+        let initial_values = {
+            let guard = kv_store.data.read().await;
+
+            keys.iter().map(|key| guard.get(key)).collect::<Vec<_>>()
+        };
+
+        let initial_events = initial_values.into_iter().map(|val| {
+            (
+                Cmd::Watch,
+                Event::default().data(val.unwrap_or_default().value),
+            )
+        });
+
+        let sub_streams = handles.into_iter().map(|rx| {
+            BroadcastStream::new(rx).map(move |msg| {
+                msg.map(|(cmd, cnt, body)| (cmd, Event::default().data(body).id(cnt.to_string())))
+            })
+        });
+
+        let streams = initial_events
+            .zip(sub_streams)
+            .map(|(event, stream)| tokio_stream::once(Ok(event)).chain(stream));
+
+        let response_stream = keys
+            .into_iter()
+            .zip(streams)
+            .collect::<StreamMap<_, _>>()
+            .map(|(key, result)| match result {
+                Ok((cmd, event)) => Ok(event.event(format!("{cmd} key {key}"))),
+                Err(e) => Err(format!("Stream error for key {key}: {e}")),
+            });
+
+        Ok(Sse::new(response_stream).keep_alive(KeepAlive::default()))
     }
 
     #[tracing::instrument(level = "trace", skip(kv_store, requests))]
@@ -1508,15 +1579,7 @@ mod routes {
         #[tracing::instrument(level = "trace", skip())]
         async fn setup_app() -> Router {
             let kv_store = Arc::new(KvStore::new());
-            Router::new()
-                .route("/store/:key", get(get_key))
-                .route("/store/:key", put(put_key_val))
-                .route("/store/:key", delete(delete_key))
-                .route("/store/cas/:key", post(compare_and_swap))
-                .route("/watch/:key", get(routes::watch_keys))
-                .route("/batch", post(batch_process))
-                .route("/status", get(status))
-                .with_state(kv_store)
+            make_app().with_state(kv_store)
         }
 
         #[tokio::test]
@@ -1713,7 +1776,7 @@ mod routes {
             // Start watching the key
             let watch_request = Request::builder()
                 .method("GET")
-                .uri(format!("/watch/{}", key))
+                .uri(format!("/watch_key/{}", key))
                 .body(Body::empty())
                 .unwrap();
 
