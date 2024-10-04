@@ -1,10 +1,10 @@
 use std::env;
+use std::future::IntoFuture;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use std::future::IntoFuture;
 
 use tokio::signal;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 
 use axum::{
@@ -26,24 +26,7 @@ const MAX_BATCH_SIZE: usize = 1024;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let port = env::var("KV_STORE_PORT")
-        .map_err(|err| match err {
-            env::VarError::NotPresent => {
-                info!("KV_STORE_PORT environment variable not set. Using default port: {}", DEFAULT_PORT);
-            }
-            env::VarError::NotUnicode(_) => {
-                error!("KV_STORE_PORT environment variable contains invalid UTF-8. Falling back to default port: {}", DEFAULT_PORT);
-            }
-        })
-            .and_then(|port_str| {
-            port_str.parse::<u16>().map_err(|_| {
-                error!("Invalid KV_STORE_PORT value: '{}'. Falling back to default port: {}", port_str, DEFAULT_PORT);
-            })
-        })
-        .inspect(|port| {
-            info!("Successfully read KV_STORE_PORT from environment: {}", port);
-        })
-            .unwrap_or(DEFAULT_PORT);
+    let port = get_port_from_env().unwrap_or(DEFAULT_PORT);
 
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
 
@@ -52,6 +35,7 @@ async fn main() {
 
     let (cleanup_tx, mut cleanup_rx) = mpsc::channel(64);
 
+    // TODO the creation of the cleanup task is a bit messy atm
     let kv_store = Arc::new(KvStore::new(cleanup_tx));
     let cleanup_store = kv_store.clone();
 
@@ -70,40 +54,12 @@ async fn main() {
         }
     });
 
-    let shutdown_future = {
-        async move {
-            let ctrl_c = async { signal::ctrl_c().await.unwrap() };
-
-            let terminate = async {
-                signal::unix::signal(signal::unix::SignalKind::terminate())
-                    .unwrap()
-                    .recv()
-                    .await;
-            };
-
-            tokio::select! {
-                () = ctrl_c => {},
-                () = terminate => {},
-            }
-
-            info!("Shutdown signal received");
-        }
-    };
-
-    let app = Router::new()
-        .route("/store/:key", get(routes::get_key))
-        .route("/store/:key", put(routes::put_key_val))
-        .route("/store/:key", delete(routes::delete_key))
-        .route("/store/cas/:key", post(routes::compare_and_swap))
-        .route("/watch/:key", get(routes::watch_keys))
-        .route("/batch", post(routes::batch_process))
-        .route("/status", get(routes::status));
-
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
 
     let server = axum::serve(
         listener,
-        app.with_state(kv_store.clone())
+        make_app()
+            .with_state(kv_store.clone())
             .layer(GovernorLayer {
                 config: Arc::new(GovernorConfig::default()),
             })
@@ -112,43 +68,96 @@ async fn main() {
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async {
-            _ = server_shutdown_rx.await;
-        });
+        _ = server_shutdown_rx.await;
+    });
 
     let server_task = tokio::spawn(server.into_future());
 
-    () = shutdown_future.await;
+    () = shutdown_signal().await;
 
     info!("Initiating server shutdown");
 
-    _ = server_shutdown_tx.send(());
-    _ = cleanup_shutdown_tx.send(());
+    tokio::spawn(async {
+        _ = server_shutdown_tx.send(());
+        match timeout(Duration::from_secs(30), server_task).await {
+            Ok(res) => {
+                if let Err(e) = res {
+                    error!("Server error: {}", e);
+                }
+            }
+            _ => {
+                warn!("Server shutdown timed out after 30 seconds");
+            }
+        }
+    });
+
+    tokio::spawn(async {
+        _ = cleanup_shutdown_tx.send(());
+        match timeout(Duration::from_secs(10), cleanup_task).await {
+            Ok(res) => {
+                if let Err(e) = res {
+                    error!("Cleanup task error: {}", e);
+                }
+            }
+            _ => {
+                warn!("Cleanup task shutdown timed out after 10 seconds");
+            }
+        }
+    });
 
     kv_store.close_publish_handles().await;
 
-    match timeout(Duration::from_secs(30), server_task).await {
-        Ok(res) => {
-            if let Err(e) = res {
-                error!("Server error: {}", e);
-            }
-        }
-        _ => {
-            warn!("Server shutdown timed out after 30 seconds");
-        }
-    }
-
-    match timeout(Duration::from_secs(10), cleanup_task).await {
-        Ok(res) => {
-            if let Err(e) = res {
-                error!("Cleanup task error: {}", e);
-            }
-        }
-        _ => {
-            warn!("Cleanup task shutdown timed out after 10 seconds");
-        }
-    }
-
     info!("Server shutdown complete");
+}
+
+fn get_port_from_env() -> Option<u16> {
+    env::var("KV_STORE_PORT")
+        .map_err(|err| match err {
+            env::VarError::NotPresent => {
+                info!("KV_STORE_PORT environment variable not set. Using default port: {}", DEFAULT_PORT);
+            }
+            env::VarError::NotUnicode(_) => {
+                error!("KV_STORE_PORT environment variable contains invalid UTF-8. Falling back to default port: {}", DEFAULT_PORT);
+            }
+        })
+            .and_then(|port_str| {
+            port_str.parse::<u16>().map_err(|_| {
+                error!("Invalid KV_STORE_PORT value: '{}'. Falling back to default port: {}", port_str, DEFAULT_PORT);
+            })
+        })
+        .inspect(|port| {
+            info!("Successfully read KV_STORE_PORT from environment: {}", port);
+        })
+            .ok()
+}
+
+fn make_app() -> Router<Arc<KvStore>> {
+    Router::new()
+        .route("/store/:key", get(routes::get_key))
+        .route("/store/:key", put(routes::put_key_val))
+        .route("/store/:key", delete(routes::delete_key))
+        .route("/store/cas/:key", post(routes::compare_and_swap))
+        .route("/watch/:key", get(routes::watch_keys))
+        .route("/batch", post(routes::batch_process))
+        .route("/status", get(routes::status))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async { signal::ctrl_c().await.unwrap() };
+
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .unwrap()
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+
+    info!("Shutdown signal received");
 }
 
 mod store_interface {
@@ -404,13 +413,22 @@ mod store_interface {
                 return KvStoreResponse::NotFound;
             };
 
-            match expires {
-                Some(expires_at) if expires_at < Instant::now() => {
+            if let Some(expires) = expires {
+                if expires < Instant::now() {
                     self.mark_key_for_removal(key);
-                    KvStoreResponse::NotFound
+                    return KvStoreResponse::NotFound;
                 }
-                _ => KvStoreResponse::SuccessBody(value),
             }
+
+            KvStoreResponse::SuccessBody(value)
+            //
+            // match expires {
+            //     Some(expires_at) if expires_at < Instant::now() => {
+            //         self.mark_key_for_removal(key);
+            //         KvStoreResponse::NotFound
+            //     }
+            //     _ => KvStoreResponse::SuccessBody(value),
+            // }
         }
 
         #[tracing::instrument(level = "trace", skip(self, key))]
@@ -1691,6 +1709,8 @@ mod routes {
 
         #[tokio::test]
         async fn test_watch_single_key() {
+            use tokio_stream::StreamExt;
+
             let app = setup_app().await;
             let key = "test_watch_key";
 
