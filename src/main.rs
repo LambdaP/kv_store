@@ -282,52 +282,42 @@ mod store_interface {
             }
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn increment_get(&self) {
             self.get_count.increment();
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn increment_put(&self) {
             self.put_count.increment();
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn increment_delete(&self) {
             self.delete_count.increment();
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn increment_cas_success(&self) {
             self.cas_success_count.increment();
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         fn increment_cas_failure(&self) {
             self.cas_failure_count.increment();
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         pub fn total_get_ops(&self) -> u64 {
             self.get_count.load()
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         pub fn total_put_ops(&self) -> u64 {
             self.put_count.load()
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         pub fn total_delete_ops(&self) -> u64 {
             self.delete_count.load()
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         pub fn total_cas_success(&self) -> u64 {
             self.cas_success_count.load()
         }
 
-        #[tracing::instrument(level = "trace", skip(self))]
         pub fn total_cas_failure(&self) -> u64 {
             self.cas_failure_count.load()
         }
