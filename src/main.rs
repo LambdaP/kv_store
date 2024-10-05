@@ -16,7 +16,9 @@ use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
 use tracing::{error, info, warn};
 
-use crate::store_interface::KvStore;
+use crate::store_interface::Metered;
+
+type Db = Metered;
 
 const DEFAULT_PORT: u16 = 3000;
 const MAX_BATCH_SIZE: usize = 1024;
@@ -31,18 +33,18 @@ async fn main() {
     let socket_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
 
-    let kv_store = Arc::new(KvStore::new());
+    let db = Arc::new(Db::new());
 
     let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
 
     let cleanup_task = tokio::spawn({
-        let cleanup_store = kv_store.clone();
+        let cleanup_store = db.clone();
         let interval_cleanup = async move {
             let mut interval = interval(Duration::from_millis(10));
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                cleanup_store.cleanup_marked_keys().await;
+                cleanup_store.store.cleanup_marked_keys().await;
             }
         };
 
@@ -61,7 +63,7 @@ async fn main() {
     let server = axum::serve(
         listener,
         make_app()
-            .with_state(kv_store.clone())
+            .with_state(db.clone())
             .layer(GovernorLayer {
                 config: Arc::new(GovernorConfig::default()),
             })
@@ -107,7 +109,7 @@ async fn main() {
         }
     });
 
-    kv_store.close_publish_handles().await;
+    db.store.close_publish_handles().await;
 
     info!("Server shutdown complete");
 }
@@ -133,7 +135,7 @@ fn get_port_from_env() -> Option<u16> {
             .ok()
 }
 
-fn make_app() -> Router<Arc<KvStore>> {
+fn make_app() -> Router<Arc<Db>> {
     Router::new()
         .route("/store/:key", get(routes::get_key))
         .route("/store/:key", put(routes::put_key_val))
@@ -179,21 +181,6 @@ mod store_interface {
 
     use crate::utf8_bytes::Utf8Bytes;
 
-    #[derive(Debug, Default)]
-    struct AU64Counter(AtomicU64);
-
-    impl AU64Counter {
-        #[tracing::instrument(level = "trace", skip(self))]
-        fn increment(&self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-
-        #[tracing::instrument(level = "trace", skip(self))]
-        fn load(&self) -> u64 {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-
     #[non_exhaustive]
     #[derive(Debug, Copy, Clone)]
     pub(crate) enum Cmd {
@@ -214,13 +201,88 @@ mod store_interface {
     type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
     type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
 
+    #[derive(Debug, Default)]
+    struct AU64Counter(AtomicU64);
+
+    impl AU64Counter {
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn increment(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[tracing::instrument(level = "trace", skip(self))]
+        fn load(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Metered {
+        pub store: KvStore,
+        pub metrics: Metrics,
+    }
+
+    impl Metered {
+        pub fn new() -> Self {
+            Self {
+                store: KvStore::new(),
+                metrics: Metrics::new(),
+            }
+        }
+
+        pub async fn insert(
+            &self,
+            key: String,
+            value: Utf8Bytes,
+            ttl: Option<Duration>,
+        ) -> KvStoreResponse {
+            self.metrics.increment_put();
+            self.store.insert(key, value, ttl).await
+        }
+
+        pub async fn get(&self, key: &str) -> KvStoreResponse {
+            self.metrics.increment_get();
+            self.store.get(key).await
+        }
+
+        pub async fn remove(&self, key: &str) -> KvStoreResponse {
+            let response = self.store.remove(key).await;
+
+            if let KvStoreResponse::Success = response {
+                self.metrics.increment_delete();
+            }
+
+            response
+        }
+
+        pub async fn compare_and_swap<'a, 'b, E>(
+            &self,
+            key: &'a str,
+            expected: &'b E,
+            new: Utf8Bytes,
+        ) -> KvStoreResponse
+        where
+            E: ?Sized,
+            Utf8Bytes: PartialEq<E>,
+        {
+            let response = self.store.compare_and_swap(key, expected, new).await;
+
+            if let KvStoreResponse::Success = response {
+                self.metrics.increment_cas_success();
+            } else {
+                self.metrics.increment_cas_failure();
+            }
+
+            response
+        }
+    }
+
     // TODO use a BTreeMap to store keys ordered by expiry date
     // TODO make sure I don't have deadlocks with the two locked structures
     #[derive(Debug)]
     pub struct KvStore {
         pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
         pub publish_handles: RwLock<HashMap<String, PubHandle>>,
-        pub metrics: Metrics,
         keys_to_remove: std::sync::Mutex<Vec<String>>,
     }
 
@@ -337,7 +399,6 @@ mod store_interface {
             KvStore {
                 data: RwLock::default(),
                 publish_handles: RwLock::default(),
-                metrics: Metrics::new(),
                 keys_to_remove: std::sync::Mutex::default(),
             }
         }
@@ -371,7 +432,6 @@ mod store_interface {
             ttl: Option<Duration>,
         ) -> KvStoreResponse {
             debug!("Inserting key: {}", key);
-            self.metrics.increment_put();
             let pub_tx = self.get_pub_tx(&key).await;
 
             // If the key is already present,
@@ -405,7 +465,6 @@ mod store_interface {
         #[tracing::instrument(level = "trace", skip(self, key))]
         pub async fn get(&self, key: &str) -> KvStoreResponse {
             debug!("Getting key: {}", key);
-            self.metrics.increment_get();
 
             let Some(inner_map::StoreEntry { value, expires }) = self.data.read().await.get(key)
             else {
@@ -425,7 +484,6 @@ mod store_interface {
         #[tracing::instrument(level = "trace", skip(self, key))]
         pub async fn remove(&self, key: &str) -> KvStoreResponse {
             debug!("Removing key: {}", key);
-            self.metrics.increment_delete();
 
             let Some(cnt) = self.data.write().await.remove(key) else {
                 return KvStoreResponse::NotFound;
@@ -439,10 +497,10 @@ mod store_interface {
         }
 
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-        pub async fn compare_and_swap<E>(
+        pub async fn compare_and_swap<'a, 'b, E>(
             &self,
-            key: &str,
-            expected: &E,
+            key: &'a str,
+            expected: &'b E,
             new: Utf8Bytes,
         ) -> KvStoreResponse
         where
@@ -457,14 +515,12 @@ mod store_interface {
                 .compare_and_swap(key, expected, new.clone())
             {
                 Ok(cnt) => {
-                    self.metrics.increment_cas_success();
                     if let Some(tx) = self.get_pub_tx(key).await {
                         _ = tx.send((Cmd::CompareAndSwap, cnt, new));
                     }
                     KvStoreResponse::Success
                 }
                 Err(key_was_there) => {
-                    self.metrics.increment_cas_failure();
                     if key_was_there {
                         // TODO should I notify subscribers here as well?
                         KvStoreResponse::CasTestFailed
@@ -534,6 +590,7 @@ mod store_interface {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::Db;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -544,7 +601,7 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_insert_and_get() {
-            let store = setup_kvstore().await;
+            let store = Db::new();
             let key = "test_key";
             let value = "test_value";
 
@@ -620,7 +677,7 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_metrics() {
-            let store = setup_kvstore().await;
+            let store = Db::new();
             let key = "metrics_key";
             let value = "metrics_value";
 
@@ -640,7 +697,7 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_metrics_accuracy() {
-            let store = Arc::new(KvStore::new());
+            let store = Db::new();
             let key = "key1";
 
             // Perform a series of operations
@@ -660,38 +717,37 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_cleanup_marked_keys() {
-            let store = Arc::new(KvStore::new());
+            let db = Db::new();
             let key = "cleanup_key";
             let value = "cleanup_value";
 
             // Insert a key with a short TTL
-            store
-                .insert(key.into(), value.into(), Some(Duration::from_millis(10)))
+            db.insert(key.into(), value.into(), Some(Duration::from_millis(10)))
                 .await;
 
             // Wait for the TTL to expire
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             // Trigger a get operation to mark the key for removal
-            let _ = store.get(&key).await;
+            let _ = db.get(&key).await;
 
             // Run the cleanup
-            store.cleanup_marked_keys().await;
+            db.store.cleanup_marked_keys().await;
 
             // The key should now be removed
-            let get_result = store.get(&key).await;
+            let get_result = db.get(&key).await;
             assert!(matches!(get_result, KvStoreResponse::NotFound));
         }
 
         #[tokio::test]
         async fn test_concurrent_access() {
-            let store = Arc::new(setup_kvstore().await);
+            let db = Arc::new(Db::new());
             let key = Arc::new("concurrent_key".to_string());
             let mut handles = vec![];
 
             // Spawn 10 tasks to insert values concurrently
             for i in 0..10 {
-                let store_clone = store.clone();
+                let store_clone = db.clone();
                 let key_clone = key.clone();
                 let handle = tokio::spawn(async move {
                     let value = format!("value_{}", i);
@@ -708,13 +764,13 @@ mod store_interface {
             }
 
             // Verify that only one value was inserted
-            let get_result = store.get(&key).await;
+            let get_result = db.get(&key).await;
             assert!(matches!(get_result, KvStoreResponse::SuccessBody(_)));
 
             // Spawn 10 tasks to get the value concurrently
             let mut get_handles = vec![];
             for _ in 0..10 {
-                let store_clone = store.clone();
+                let store_clone = db.clone();
                 let key_clone = key.clone();
                 let handle = tokio::spawn(async move { store_clone.get(&key_clone).await });
                 get_handles.push(handle);
@@ -726,14 +782,14 @@ mod store_interface {
                 assert!(matches!(result, KvStoreResponse::SuccessBody(_)));
             }
 
-            _ = store
+            _ = db
                 .insert(key.to_string(), format!("value_0").into(), None)
                 .await;
 
             // Test concurrent CAS operations
             let mut cas_handles = vec![];
             for i in 0..10 {
-                let store_clone = store.clone();
+                let store_clone = db.clone();
                 let key_clone = key.clone();
                 let handle = tokio::spawn(async move {
                     let new_value = format!("new_value_{}", i);
@@ -1311,48 +1367,44 @@ mod routes {
         value: Option<Utf8Bytes>,
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store))]
-    pub async fn get_key(
-        State(kv_store): State<Arc<KvStore>>,
-        Path(key): Path<String>,
-    ) -> impl IntoResponse {
-        kv_store.get(&key).await
+    #[tracing::instrument(level = "trace", skip(db))]
+    pub async fn get_key(State(db): State<Arc<Db>>, Path(key): Path<String>) -> impl IntoResponse {
+        db.get(&key).await
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store, value))]
+    #[tracing::instrument(level = "trace", skip(db, value))]
     pub async fn put_key_val(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Path(key): Path<String>,
         Query(query): Query<PutRequestQueryParams>,
         value: Utf8Bytes,
     ) -> impl IntoResponse {
         let ttl = query.ttl.map(Duration::from_secs);
-        kv_store.insert(key, value, ttl).await
+        db.insert(key, value, ttl).await
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store))]
+    #[tracing::instrument(level = "trace", skip(db))]
     pub async fn delete_key(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
-        kv_store.remove(&key).await
+        db.remove(&key).await
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store, cas_payload))]
+    #[tracing::instrument(level = "trace", skip(db, cas_payload))]
     pub async fn compare_and_swap(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Path(key): Path<String>,
         Json(cas_payload): Json<CasPayload>,
     ) -> impl IntoResponse {
-        kv_store
-            .compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
+        db.compare_and_swap(&key, &cas_payload.expected, cas_payload.new)
             .await
     }
 
     // TODO allow for watching multiple keys
-    #[tracing::instrument(level = "trace", skip(kv_store))]
+    #[tracing::instrument(level = "trace", skip(db))]
     pub async fn watch_key(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
         use crate::store_interface::Cmd;
@@ -1360,21 +1412,22 @@ mod routes {
         use axum::response::sse::{Event, KeepAlive, Sse};
         use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-        let sub_rx = if let Some(tx) = kv_store.get_pub_tx(&key).await {
+        let store = &db.store;
+
+        let sub_rx = if let Some(tx) = store.get_pub_tx(&key).await {
             tx
         } else {
-            kv_store.create_pub_tx(key.clone()).await
+            store.create_pub_tx(key.clone()).await
         }
         .subscribe();
 
-        let first_event = if let Some(inner_map::StoreEntry { value, .. }) =
-            kv_store.data.read().await.get(&key)
-        {
-            Event::default().data(value)
-        } else {
-            Event::default()
-        }
-        .event(format!("WATCH key {key}"));
+        let first_event =
+            if let Some(inner_map::StoreEntry { value, .. }) = store.data.read().await.get(&key) {
+                Event::default().data(value)
+            } else {
+                Event::default()
+            }
+            .event(format!("WATCH key {key}"));
 
         let first_msg = tokio_stream::once(Ok(first_event));
 
@@ -1405,9 +1458,9 @@ mod routes {
         Sse::new(response_stream).keep_alive(KeepAlive::default())
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store))]
+    #[tracing::instrument(level = "trace", skip(db))]
     pub async fn watch_multiple_keys(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Json(keys): Json<Vec<String>>,
     ) -> impl IntoResponse {
         use crate::store_interface::Cmd;
@@ -1417,6 +1470,8 @@ mod routes {
 
         tracing::trace!("Watching multiple keys {keys:?}");
 
+        let store = &db.store;
+
         if keys.is_empty() {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -1424,17 +1479,17 @@ mod routes {
         let mut handles = vec![];
 
         for key in &keys {
-            let key_pub_tx = if let Some(tx) = kv_store.get_pub_tx(key).await {
+            let key_pub_tx = if let Some(tx) = store.get_pub_tx(key).await {
                 tx
             } else {
-                kv_store.create_pub_tx(key.clone()).await
+                store.create_pub_tx(key.clone()).await
             };
 
             handles.push(key_pub_tx.subscribe());
         }
 
         let initial_values = {
-            let guard = kv_store.data.read().await;
+            let guard = store.data.read().await;
 
             keys.iter().map(|key| guard.get(key)).collect::<Vec<_>>()
         };
@@ -1468,9 +1523,9 @@ mod routes {
         Ok(Sse::new(response_stream).keep_alive(KeepAlive::default()))
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store, requests))]
+    #[tracing::instrument(level = "trace", skip(db, requests))]
     pub async fn batch_process(
-        State(kv_store): State<Arc<KvStore>>,
+        State(db): State<Arc<Db>>,
         Json(requests): Json<Vec<SimpleRequest>>,
     ) -> impl IntoResponse {
         if requests.len() > MAX_BATCH_SIZE {
@@ -1478,19 +1533,17 @@ mod routes {
         }
 
         let handles = requests.into_iter().map(|request| {
-            let kv_store = kv_store.clone();
+            let db = db.clone();
             match request {
                 SimpleRequest::Get { key } => {
-                    tokio::task::spawn(async move { kv_store.get(&key).await.into_status_body() })
+                    tokio::task::spawn(async move { db.get(&key).await.into_status_body() })
                 }
                 SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
                     let ttl = ttl.map(Duration::from_secs);
-                    kv_store.insert(key, value, ttl).await.into_status_body()
+                    db.insert(key, value, ttl).await.into_status_body()
                 }),
                 SimpleRequest::Delete { key } => {
-                    tokio::task::spawn(
-                        async move { kv_store.remove(&key).await.into_status_body() },
-                    )
+                    tokio::task::spawn(async move { db.remove(&key).await.into_status_body() })
                 }
             }
         });
@@ -1510,14 +1563,14 @@ mod routes {
         Ok(Json(responses))
     }
 
-    #[tracing::instrument(level = "trace", skip(kv_store))]
-    pub async fn status(State(kv_store): State<Arc<KvStore>>) -> impl IntoResponse {
-        (StatusCode::OK, Json(make_status(&kv_store).await))
+    #[tracing::instrument(level = "trace", skip(db))]
+    pub async fn status(State(db): State<Arc<Db>>) -> impl IntoResponse {
+        (StatusCode::OK, Json(make_status(&db).await))
     }
 
-    #[tracing::instrument(level = "trace", skip(data, metrics))]
-    async fn make_status(KvStore { data, metrics, .. }: &KvStore) -> StatusResponse {
-        let total_keys = { data.read().await.len() };
+    #[tracing::instrument(level = "trace", skip(store, metrics))]
+    async fn make_status(Db { store, metrics, .. }: &Db) -> StatusResponse {
+        let total_keys = { store.data.read().await.len() };
 
         let get_operations = metrics.total_get_ops();
         let put_operations = metrics.total_put_ops();
@@ -1568,8 +1621,8 @@ mod routes {
 
         #[tracing::instrument(level = "trace", skip())]
         async fn setup_app() -> Router {
-            let kv_store = Arc::new(KvStore::new());
-            make_app().with_state(kv_store)
+            let db = Arc::new(Db::new());
+            make_app().with_state(db)
         }
 
         #[tokio::test]
