@@ -14,7 +14,6 @@ use axum::{
 };
 
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
-use tower_http::metrics::in_flight_requests::InFlightRequestsCounter;
 use tower_http::metrics::InFlightRequestsLayer;
 
 use tracing::{error, info, warn};
@@ -198,6 +197,7 @@ mod store_interface {
         time::{Duration, Instant},
     };
     use tokio::sync::{broadcast, RwLock};
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
     use tower_http::metrics::in_flight_requests::InFlightRequestsCounter;
     use tracing::{debug, info};
 
@@ -206,12 +206,25 @@ mod store_interface {
     #[non_exhaustive]
     #[derive(Debug, Copy, Clone)]
     pub(crate) enum Cmd {
-        Get,
-        Put,
-        Delete,
-        CompareAndSwap,
-        Expired,
+        Get(u64),
+        Put(u64),
+        Delete(u64),
+        CompareAndSwap(u64),
+        Expired(u64),
         Watch,
+    }
+
+    impl Cmd {
+        pub(crate) fn get_counter(self) -> Option<u64> {
+            match self {
+                Cmd::Get(c)
+                | Cmd::Put(c)
+                | Cmd::Delete(c)
+                | Cmd::CompareAndSwap(c)
+                | Cmd::Expired(c) => Some(c),
+                _ => None,
+            }
+        }
     }
 
     impl std::fmt::Display for Cmd {
@@ -220,8 +233,8 @@ mod store_interface {
         }
     }
 
-    type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
-    type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
+    type PubHandle = broadcast::Sender<(Cmd, Utf8Bytes)>;
+    type SubHandle = broadcast::Receiver<(Cmd, Utf8Bytes)>;
 
     #[derive(Debug)]
     pub(crate) struct AppRequestsCounters {
@@ -324,6 +337,24 @@ mod store_interface {
 
             response
         }
+
+        pub async fn watch_key(
+            &self,
+            key: String,
+        ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
+        {
+            self.ops_counters.increment(CountOps::WatchKey);
+            self.store.watch_keys(vec![key]).await
+        }
+
+        pub async fn watch_multiple_keys(
+            &self,
+            keys: Vec<String>,
+        ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
+        {
+            self.ops_counters.increment(CountOps::WatchMultipleKeys);
+            self.store.watch_keys(keys).await
+        }
     }
 
     // TODO use a BTreeMap to store keys ordered by expiry date
@@ -378,7 +409,7 @@ mod store_interface {
         WatchMultipleKeys,
     }
 
-    const N_COUNT_OPS: usize = CountOps::CasFailure as usize + 1;
+    const N_COUNT_OPS: usize = CountOps::WatchMultipleKeys as usize + 1;
     #[derive(Debug, Default, PartialEq, Eq)]
     pub struct OpsMap<T>([T; N_COUNT_OPS]);
 
@@ -406,26 +437,6 @@ mod store_interface {
 
     type OpsCounters = OpsMap<AtomicU64>;
 
-    // impl<T> std::ops::Index<CountOps> for [T; N_COUNT_OPS] {
-    //     type Output = T;
-    //     fn index(&self, idx: CountOps) -> &T {
-    //         &self[idx as usize]
-    //     }
-    // }
-    //
-    // #[derive(Debug, Default)]
-    // pub struct OpsCounters([AtomicU64; N_COUNT_OPS]);
-
-    // #[derive(Debug, Default)]
-    // pub struct OpsCounters<const LEN: usize>([AtomicU64; LEN]);
-
-    // impl std::ops::Index<CountOps> for OpsCounters {
-    //     type Output = AtomicU64;
-    //     fn index(&self, ops: CountOps) -> &AtomicU64 {
-    //         &self.0[ops as usize]
-    //     }
-    // }
-    //
     impl OpsMap<AtomicU64> {
         pub fn increment(&self, ops: CountOps) -> u64 {
             self[ops].fetch_add(1, Ordering::Relaxed)
@@ -449,25 +460,6 @@ mod store_interface {
             None
         }
     }
-
-    // #[derive(Debug)]
-    // pub struct Metrics {
-    //     counters: OpsCounters,
-    // }
-    //
-    // #[tracing::instrument(level = "trace", skip(n))]
-    // fn increment_au64(n: &AtomicU64) {
-    //     n.fetch_add(1, Ordering::Relaxed);
-    // }
-    //
-    // impl Metrics {
-    //     #[tracing::instrument(level = "trace", skip())]
-    //     fn new() -> Self {
-    //         Metrics {
-    //             counters: OpsCounters::new(),
-    //         }
-    //     }
-    // }
 
     impl IntoResponse for KvStoreResponse {
         #[tracing::instrument(level = "trace", skip(self))]
@@ -526,7 +518,7 @@ mod store_interface {
                 //   even if the new value is the same as before.
                 // Fix this.
                 if let Some(tx) = pub_tx {
-                    _ = tx.send((Cmd::Put, cnt, value));
+                    _ = tx.send((Cmd::Put(cnt), value));
                 }
                 return KvStoreResponse::Success;
             }
@@ -535,7 +527,7 @@ mod store_interface {
 
             if let Some(tx) = pub_tx {
                 // TODO consider using a different Cmd here to signal Update
-                _ = tx.send((Cmd::Put, cnt, value));
+                _ = tx.send((Cmd::Put(cnt), value));
             }
 
             if key_exists {
@@ -574,17 +566,17 @@ mod store_interface {
             };
 
             if let Some(tx) = self.get_pub_tx(key).await {
-                _ = tx.send((Cmd::Delete, cnt, "".into()));
+                _ = tx.send((Cmd::Delete(cnt), "".into()));
             }
 
             KvStoreResponse::Success
         }
 
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-        pub async fn compare_and_swap<'a, 'b, E>(
+        pub async fn compare_and_swap<E>(
             &self,
-            key: &'a str,
-            expected: &'b E,
+            key: &str,
+            expected: &E,
             new: Utf8Bytes,
         ) -> KvStoreResponse
         where
@@ -600,7 +592,7 @@ mod store_interface {
             {
                 Ok(cnt) => {
                     if let Some(tx) = self.get_pub_tx(key).await {
-                        _ = tx.send((Cmd::CompareAndSwap, cnt, new));
+                        _ = tx.send((Cmd::CompareAndSwap(cnt), new));
                     }
                     KvStoreResponse::Success
                 }
@@ -613,6 +605,43 @@ mod store_interface {
                     }
                 }
             }
+        }
+
+        #[tracing::instrument(level = "trace", skip(self, keys))]
+        pub async fn watch_keys(
+            &self,
+            keys: Vec<String>,
+        ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
+        {
+            use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
+            let mut handles = vec![];
+
+            for key in &keys {
+                let key_pub_tx = if let Some(tx) = self.get_pub_tx(key).await {
+                    tx
+                } else {
+                    self.create_pub_tx(key.clone()).await
+                };
+
+                handles.push(key_pub_tx.subscribe());
+            }
+
+            let initial_values = {
+                let guard = self.data.read().await;
+
+                keys.iter().map(|key| guard.get(key)).collect::<Vec<_>>()
+            };
+
+            let initial_commands = initial_values
+                .into_iter()
+                .map(|val| (Cmd::Watch, val.map(|entry| entry.value).unwrap_or_default()));
+
+            let streams = handles
+                .into_iter()
+                .zip(initial_commands)
+                .map(|(rx, init)| tokio_stream::once(Ok(init)).chain(BroadcastStream::new(rx)));
+
+            keys.into_iter().zip(streams).collect::<StreamMap<_, _>>()
         }
 
         #[tracing::instrument(level = "trace", skip(self))]
@@ -659,7 +688,7 @@ mod store_interface {
 
             for (key, cnt) in removed {
                 if let Some(tx) = guard.get(&key) {
-                    _ = tx.send((Cmd::Expired, cnt, "".into()));
+                    _ = tx.send((Cmd::Expired(cnt), "".into()));
                 }
             }
         }
@@ -1189,6 +1218,9 @@ mod utf8_bytes {
     pub struct Utf8Bytes(Bytes);
 
     impl Utf8Bytes {
+        pub const fn empty() -> Self {
+            Self::from_static("")
+        }
         pub const fn from_static(s: &'static str) -> Self {
             Self(Bytes::from_static(s.as_bytes()))
         }
@@ -1489,59 +1521,30 @@ mod routes {
             .await
     }
 
-    // TODO allow for watching multiple keys
     #[tracing::instrument(level = "trace", skip(db))]
     pub async fn watch_key(
         State(db): State<Arc<Db>>,
         Path(key): Path<String>,
     ) -> impl IntoResponse {
-        use crate::store_interface::Cmd;
-
         use axum::response::sse::{Event, KeepAlive, Sse};
-        use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+        use tokio_stream::StreamExt;
 
-        let store = &db.store;
+        tracing::trace!("Watching key {key:?}");
 
-        let sub_rx = if let Some(tx) = store.get_pub_tx(&key).await {
-            tx
-        } else {
-            store.create_pub_tx(key.clone()).await
-        }
-        .subscribe();
+        let stream = db.watch_key(key).await;
 
-        let first_event =
-            if let Some(inner_map::StoreEntry { value, .. }) = store.data.read().await.get(&key) {
-                Event::default().data(value)
-            } else {
-                Event::default()
+        let response_stream = stream.map(|(key, result)| match result {
+            Ok((cmd, body)) => {
+                let event = Event::default()
+                    .event(format!("{cmd} key {key}"))
+                    .data(body);
+                if let Some(cnt) = cmd.get_counter() {
+                    return Ok(event.id(cnt.to_string()));
+                }
+                Ok(event)
             }
-            .event(format!("WATCH key {key}"));
-
-        let first_msg = tokio_stream::once(Ok(first_event));
-
-        // TODO consider throttling
-        let sub_stream = BroadcastStream::new(sub_rx).map(move |msg| {
-            msg.map(|(cmd, cnt, body)| {
-                // TODO escape `body`
-                //   so that it doesn't contain carriage returns,
-                //   as those cannot be transmitted
-                //   newlines should also be escaped,
-                //   and maybe more stuff
-                //   alternatively, use `json_data()`
-                Event::default()
-                    .data(body)
-                    .event(match cmd {
-                        Cmd::Put => format!("PUT key {key}"),
-                        Cmd::Delete => format!("DELETE key {key}"),
-                        Cmd::CompareAndSwap => format!("CAS key {key}"),
-                        Cmd::Expired => format!("EXPIRED key {key}"),
-                        _ => unreachable!(),
-                    })
-                    .id(cnt.to_string())
-            })
+            Err(e) => Err(format!("Stream error for key {key}: {e}")),
         });
-
-        let response_stream = first_msg.chain(sub_stream);
 
         Sse::new(response_stream).keep_alive(KeepAlive::default())
     }
@@ -1551,62 +1554,29 @@ mod routes {
         State(db): State<Arc<Db>>,
         Json(keys): Json<Vec<String>>,
     ) -> impl IntoResponse {
-        use crate::store_interface::Cmd;
-
         use axum::response::sse::{Event, KeepAlive, Sse};
-        use tokio_stream::{wrappers::BroadcastStream, StreamExt, StreamMap};
+        use tokio_stream::StreamExt;
 
         tracing::trace!("Watching multiple keys {keys:?}");
-
-        let store = &db.store;
 
         if keys.is_empty() {
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let mut handles = vec![];
+        let stream = db.watch_multiple_keys(keys).await;
 
-        for key in &keys {
-            let key_pub_tx = if let Some(tx) = store.get_pub_tx(key).await {
-                tx
-            } else {
-                store.create_pub_tx(key.clone()).await
-            };
-
-            handles.push(key_pub_tx.subscribe());
-        }
-
-        let initial_values = {
-            let guard = store.data.read().await;
-
-            keys.iter().map(|key| guard.get(key)).collect::<Vec<_>>()
-        };
-
-        let initial_events = initial_values.into_iter().map(|val| {
-            (
-                Cmd::Watch,
-                Event::default().data(val.unwrap_or_default().value),
-            )
+        let response_stream = stream.map(|(key, result)| match result {
+            Ok((cmd, body)) => {
+                let event = Event::default()
+                    .event(format!("{cmd} key {key}"))
+                    .data(body);
+                if let Some(cnt) = cmd.get_counter() {
+                    return Ok(event.id(cnt.to_string()));
+                }
+                Ok(event)
+            }
+            Err(e) => Err(format!("Stream error for key {key}: {e}")),
         });
-
-        let sub_streams = handles.into_iter().map(|rx| {
-            BroadcastStream::new(rx).map(move |msg| {
-                msg.map(|(cmd, cnt, body)| (cmd, Event::default().data(body).id(cnt.to_string())))
-            })
-        });
-
-        let streams = initial_events
-            .zip(sub_streams)
-            .map(|(event, stream)| tokio_stream::once(Ok(event)).chain(stream));
-
-        let response_stream = keys
-            .into_iter()
-            .zip(streams)
-            .collect::<StreamMap<_, _>>()
-            .map(|(key, result)| match result {
-                Ok((cmd, event)) => Ok(event.event(format!("{cmd} key {key}"))),
-                Err(e) => Err(format!("Stream error for key {key}: {e}")),
-            });
 
         Ok(Sse::new(response_stream).keep_alive(KeepAlive::default()))
     }
