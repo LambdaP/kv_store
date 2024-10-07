@@ -8,12 +8,14 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
 
 use axum::{
+    handler::Handler,
     routing::{delete, get, post, put},
     Router,
 };
 
-use tower_http::metrics::InFlightRequestsLayer;
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
+use tower_http::metrics::in_flight_requests::InFlightRequestsCounter;
+use tower_http::metrics::InFlightRequestsLayer;
 
 use tracing::{error, info, warn};
 
@@ -136,14 +138,32 @@ fn get_port_from_env() -> Option<u16> {
 }
 
 fn make_app(db: Arc<Db>) -> Router {
+    let requests_counters = &db.requests_counters;
+
     Router::new()
         .route("/store/:key", get(routes::get_key))
         .route("/store/:key", put(routes::put_key_val))
         .route("/store/:key", delete(routes::delete_key))
         .route("/store/cas/:key", post(routes::compare_and_swap))
-        .route("/watch_key/:key", get(routes::watch_key))
-        .route("/watch", post(routes::watch_multiple_keys))
-        .route("/batch", post(routes::batch_process))
+        .route(
+            "/watch_key/:key",
+            get(routes::watch_key
+                .layer(InFlightRequestsLayer::new(requests_counters.watch.clone()))),
+        )
+        .route(
+            "/watch",
+            post(
+                routes::watch_multiple_keys
+                    .layer(InFlightRequestsLayer::new(requests_counters.watch.clone())),
+            ),
+        )
+        .route(
+            "/batch",
+            post(
+                routes::batch_process
+                    .layer(InFlightRequestsLayer::new(requests_counters.batch.clone())),
+            ),
+        )
         .route("/status", get(routes::status))
         .with_state(db)
 }
@@ -178,6 +198,7 @@ mod store_interface {
         time::{Duration, Instant},
     };
     use tokio::sync::{broadcast, RwLock};
+    use tower_http::metrics::in_flight_requests::InFlightRequestsCounter;
     use tracing::{debug, info};
 
     use crate::utf8_bytes::Utf8Bytes;
@@ -203,9 +224,25 @@ mod store_interface {
     type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
 
     #[derive(Debug)]
+    pub(crate) struct AppRequestsCounters {
+        pub watch: InFlightRequestsCounter,
+        pub batch: InFlightRequestsCounter,
+    }
+
+    impl AppRequestsCounters {
+        fn new() -> Self {
+            Self {
+                watch: InFlightRequestsCounter::new(),
+                batch: InFlightRequestsCounter::new(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
     pub struct Metered {
         pub store: KvStore,
         pub start_time: Instant,
+        pub requests_counters: AppRequestsCounters,
         ops_counters: OpsCounters,
     }
 
@@ -215,6 +252,7 @@ mod store_interface {
                 store: KvStore::new(),
                 start_time: Instant::now(),
                 ops_counters: OpsCounters::new(),
+                requests_counters: AppRequestsCounters::new(),
             }
         }
 
@@ -227,8 +265,16 @@ mod store_interface {
             Instant::now().signed_duration_since(self.start_time)
         }
 
-        pub fn load_counters(&self) -> OpsMap<u64> {
+        pub fn get_ops_counters(&self) -> OpsMap<u64> {
             self.ops_counters.load_all()
+        }
+
+        pub fn get_watch_requests_count(&self) -> usize {
+            self.requests_counters.watch.get()
+        }
+
+        pub fn get_batch_requests_count(&self) -> usize {
+            self.requests_counters.batch.get()
         }
 
         pub async fn insert(
@@ -724,7 +770,7 @@ mod store_interface {
             db.remove(&key).await;
             db.compare_and_swap(&key, &value, "new_value".into()).await;
 
-            let counters = db.load_counters();
+            let counters = db.get_ops_counters();
 
             assert_eq!(counters[CountOps::Put], 1);
             assert_eq!(counters[CountOps::Get], 1);
@@ -745,7 +791,7 @@ mod store_interface {
             db.remove(&key).await;
             db.compare_and_swap("key2", "old", "new".into()).await;
 
-            let counters = db.load_counters();
+            let counters = db.get_ops_counters();
 
             // Check metrics
             assert_eq!(counters[CountOps::Put], 1);
@@ -1378,6 +1424,8 @@ mod routes {
         cas_operations: u64,
         successful_cas_operations: u64,
         failed_cas_operations: u64,
+        watch_requests_count: usize,
+        batch_requests_count: usize,
         server_time: String,
         version: String,
     }
@@ -1613,7 +1661,7 @@ mod routes {
         use crate::store_interface::CountOps;
 
         let total_keys = db.keys_len().await;
-        let counters = db.load_counters();
+        let counters = db.get_ops_counters();
 
         let get_operations = counters[CountOps::Get];
         let put_operations = counters[CountOps::Put];
@@ -1623,6 +1671,9 @@ mod routes {
         // TODO this logic belongs to `Metered`
         let cas_operations = successful_cas_operations + failed_cas_operations;
         let total_operations = get_operations + put_operations + delete_operations + cas_operations;
+
+        let watch_requests_count = db.get_watch_requests_count();
+        let batch_requests_count = db.get_batch_requests_count();
 
         let version = env!("CARGO_PKG_VERSION").into();
 
@@ -1644,6 +1695,8 @@ mod routes {
             failed_cas_operations,
             cas_operations,
             total_operations,
+            watch_requests_count,
+            batch_requests_count,
             server_time,
             version,
         }
