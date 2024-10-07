@@ -11,6 +11,7 @@ serde = { version = "1.0.210", features = ["derive"] }
 time = { version = "0.3.36", features = ["formatting", "local-offset", "serde", "serde-human-readable", "serde-well-known"] }
 tokio = { version = "1.40.0", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.16", features = ["sync"] }
+tower-http = { version = "0.6.1", features = ["metrics"] }
 tower_governor = { version = "0.4.2", features = ["tracing", "axum"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

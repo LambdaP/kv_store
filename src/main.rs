@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 
+use tower_http::metrics::InFlightRequestsLayer;
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
 
 use tracing::{error, info, warn};
@@ -62,8 +63,7 @@ async fn main() {
 
     let server = axum::serve(
         listener,
-        make_app()
-            .with_state(db.clone())
+        make_app(db.clone())
             .layer(GovernorLayer {
                 config: Arc::new(GovernorConfig::default()),
             })
@@ -135,7 +135,7 @@ fn get_port_from_env() -> Option<u16> {
             .ok()
 }
 
-fn make_app() -> Router<Arc<Db>> {
+fn make_app(db: Arc<Db>) -> Router {
     Router::new()
         .route("/store/:key", get(routes::get_key))
         .route("/store/:key", put(routes::put_key_val))
@@ -145,6 +145,7 @@ fn make_app() -> Router<Arc<Db>> {
         .route("/watch", post(routes::watch_multiple_keys))
         .route("/batch", post(routes::batch_process))
         .route("/status", get(routes::status))
+        .with_state(db)
 }
 
 async fn shutdown_signal() {
@@ -201,33 +202,33 @@ mod store_interface {
     type PubHandle = broadcast::Sender<(Cmd, u64, Utf8Bytes)>;
     type SubHandle = broadcast::Receiver<(Cmd, u64, Utf8Bytes)>;
 
-    #[derive(Debug, Default)]
-    struct AU64Counter(AtomicU64);
-
-    impl AU64Counter {
-        #[tracing::instrument(level = "trace", skip(self))]
-        fn increment(&self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-
-        #[tracing::instrument(level = "trace", skip(self))]
-        fn load(&self) -> u64 {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-
     #[derive(Debug)]
     pub struct Metered {
         pub store: KvStore,
-        pub metrics: Metrics,
+        pub start_time: Instant,
+        ops_counters: OpsCounters,
     }
 
     impl Metered {
         pub fn new() -> Self {
             Self {
                 store: KvStore::new(),
-                metrics: Metrics::new(),
+                start_time: Instant::now(),
+                ops_counters: OpsCounters::new(),
             }
+        }
+
+        pub async fn keys_len(&self) -> usize {
+            self.store.data.read().await.len()
+        }
+
+        pub fn uptime(&self) -> time::Duration {
+            use time::ext::InstantExt;
+            Instant::now().signed_duration_since(self.start_time)
+        }
+
+        pub fn load_counters(&self) -> OpsMap<u64> {
+            self.ops_counters.load_all()
         }
 
         pub async fn insert(
@@ -236,29 +237,31 @@ mod store_interface {
             value: Utf8Bytes,
             ttl: Option<Duration>,
         ) -> KvStoreResponse {
-            self.metrics.increment_put();
-            self.store.insert(key, value, ttl).await
+            let response = self.store.insert(key, value, ttl).await;
+            self.ops_counters.increment(CountOps::Put);
+            response
         }
 
         pub async fn get(&self, key: &str) -> KvStoreResponse {
-            self.metrics.increment_get();
-            self.store.get(key).await
+            let response = self.store.get(key).await;
+            self.ops_counters.increment(CountOps::Get);
+            response
         }
 
         pub async fn remove(&self, key: &str) -> KvStoreResponse {
             let response = self.store.remove(key).await;
 
             if let KvStoreResponse::Success = response {
-                self.metrics.increment_delete();
+                self.ops_counters.increment(CountOps::Delete);
             }
 
             response
         }
 
-        pub async fn compare_and_swap<'a, 'b, E>(
+        pub async fn compare_and_swap<E>(
             &self,
-            key: &'a str,
-            expected: &'b E,
+            key: &str,
+            expected: &E,
             new: Utf8Bytes,
         ) -> KvStoreResponse
         where
@@ -268,9 +271,9 @@ mod store_interface {
             let response = self.store.compare_and_swap(key, expected, new).await;
 
             if let KvStoreResponse::Success = response {
-                self.metrics.increment_cas_success();
+                self.ops_counters.increment(CountOps::CasSuccess);
             } else {
-                self.metrics.increment_cas_failure();
+                self.ops_counters.increment(CountOps::CasFailure);
             }
 
             response
@@ -316,74 +319,109 @@ mod store_interface {
         }
     }
 
-    #[derive(Debug)]
-    pub struct Metrics {
-        pub start_time: Instant,
-        get_count: AU64Counter,
-        put_count: AU64Counter,
-        delete_count: AU64Counter,
-        cas_success_count: AU64Counter,
-        cas_failure_count: AU64Counter,
+    #[non_exhaustive]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    pub enum CountOps {
+        Get = 0,
+        Put,
+        Delete,
+        CasSuccess,
+        CasFailure,
+        Batch,
+        WatchKey,
+        WatchMultipleKeys,
     }
 
-    #[tracing::instrument(level = "trace", skip(n))]
-    fn increment_au64(n: &AtomicU64) {
-        n.fetch_add(1, Ordering::Relaxed);
+    const N_COUNT_OPS: usize = CountOps::CasFailure as usize + 1;
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct OpsMap<T>([T; N_COUNT_OPS]);
+
+    impl<T> std::ops::Index<CountOps> for OpsMap<T> {
+        type Output = T;
+        fn index(&self, ops: CountOps) -> &T {
+            &self.0[ops as usize]
+        }
     }
 
-    impl Metrics {
-        #[tracing::instrument(level = "trace", skip())]
+    impl<T> OpsMap<T>
+    where
+        T: Default,
+    {
         fn new() -> Self {
-            Metrics {
-                start_time: Instant::now(),
-                get_count: AU64Counter::default(),
-                put_count: AU64Counter::default(),
-                delete_count: AU64Counter::default(),
-                cas_success_count: AU64Counter::default(),
-                cas_failure_count: AU64Counter::default(),
-            }
-        }
-
-        fn increment_get(&self) {
-            self.get_count.increment();
-        }
-
-        fn increment_put(&self) {
-            self.put_count.increment();
-        }
-
-        fn increment_delete(&self) {
-            self.delete_count.increment();
-        }
-
-        fn increment_cas_success(&self) {
-            self.cas_success_count.increment();
-        }
-
-        fn increment_cas_failure(&self) {
-            self.cas_failure_count.increment();
-        }
-
-        pub fn total_get_ops(&self) -> u64 {
-            self.get_count.load()
-        }
-
-        pub fn total_put_ops(&self) -> u64 {
-            self.put_count.load()
-        }
-
-        pub fn total_delete_ops(&self) -> u64 {
-            self.delete_count.load()
-        }
-
-        pub fn total_cas_success(&self) -> u64 {
-            self.cas_success_count.load()
-        }
-
-        pub fn total_cas_failure(&self) -> u64 {
-            self.cas_failure_count.load()
+            Self::default()
         }
     }
+
+    impl<T> From<[T; N_COUNT_OPS]> for OpsMap<T> {
+        fn from(arr: [T; N_COUNT_OPS]) -> OpsMap<T> {
+            OpsMap(arr)
+        }
+    }
+
+    type OpsCounters = OpsMap<AtomicU64>;
+
+    // impl<T> std::ops::Index<CountOps> for [T; N_COUNT_OPS] {
+    //     type Output = T;
+    //     fn index(&self, idx: CountOps) -> &T {
+    //         &self[idx as usize]
+    //     }
+    // }
+    //
+    // #[derive(Debug, Default)]
+    // pub struct OpsCounters([AtomicU64; N_COUNT_OPS]);
+
+    // #[derive(Debug, Default)]
+    // pub struct OpsCounters<const LEN: usize>([AtomicU64; LEN]);
+
+    // impl std::ops::Index<CountOps> for OpsCounters {
+    //     type Output = AtomicU64;
+    //     fn index(&self, ops: CountOps) -> &AtomicU64 {
+    //         &self.0[ops as usize]
+    //     }
+    // }
+    //
+    impl OpsMap<AtomicU64> {
+        pub fn increment(&self, ops: CountOps) -> u64 {
+            self[ops].fetch_add(1, Ordering::Relaxed)
+        }
+
+        pub fn load(&self, ops: CountOps) -> u64 {
+            self[ops].load(Ordering::Relaxed)
+        }
+
+        pub fn load_all(&self) -> OpsMap<u64> {
+            self.0.each_ref().map(|c| c.load(Ordering::Relaxed)).into()
+        }
+
+        pub fn try_snapshot(&self) -> Option<OpsMap<u64>> {
+            let snapshot = self.load_all();
+
+            if snapshot == self.load_all() {
+                return Some(snapshot);
+            }
+
+            None
+        }
+    }
+
+    // #[derive(Debug)]
+    // pub struct Metrics {
+    //     counters: OpsCounters,
+    // }
+    //
+    // #[tracing::instrument(level = "trace", skip(n))]
+    // fn increment_au64(n: &AtomicU64) {
+    //     n.fetch_add(1, Ordering::Relaxed);
+    // }
+    //
+    // impl Metrics {
+    //     #[tracing::instrument(level = "trace", skip())]
+    //     fn new() -> Self {
+    //         Metrics {
+    //             counters: OpsCounters::new(),
+    //         }
+    //     }
+    // }
 
     impl IntoResponse for KvStoreResponse {
         #[tracing::instrument(level = "trace", skip(self))]
@@ -677,42 +715,44 @@ mod store_interface {
 
         #[tokio::test]
         async fn test_metrics() {
-            let store = Db::new();
+            let db = Db::new();
             let key = "metrics_key";
             let value = "metrics_value";
 
-            store.insert(key.into(), value.into(), None).await;
-            store.get(&key).await;
-            store.remove(&key).await;
-            store
-                .compare_and_swap(&key, &value, "new_value".into())
-                .await;
+            db.insert(key.into(), value.into(), None).await;
+            db.get(&key).await;
+            db.remove(&key).await;
+            db.compare_and_swap(&key, &value, "new_value".into()).await;
 
-            assert_eq!(store.metrics.total_put_ops(), 1);
-            assert_eq!(store.metrics.total_get_ops(), 1);
-            assert_eq!(store.metrics.total_delete_ops(), 1);
-            assert_eq!(store.metrics.total_cas_failure(), 1);
-            assert_eq!(store.metrics.total_cas_success(), 0);
+            let counters = db.load_counters();
+
+            assert_eq!(counters[CountOps::Put], 1);
+            assert_eq!(counters[CountOps::Get], 1);
+            assert_eq!(counters[CountOps::Delete], 1);
+            assert_eq!(counters[CountOps::CasFailure], 1);
+            assert_eq!(counters[CountOps::CasSuccess], 0);
         }
 
         #[tokio::test]
         async fn test_metrics_accuracy() {
-            let store = Db::new();
+            let db = Db::new();
             let key = "key1";
 
             // Perform a series of operations
-            store.insert(key.into(), "value1".into(), None).await;
-            store.get(&key).await;
-            store.get("non_existent").await;
-            store.remove(&key).await;
-            store.compare_and_swap("key2", "old", "new".into()).await;
+            db.insert(key.into(), "value1".into(), None).await;
+            db.get(&key).await;
+            db.get("non_existent").await;
+            db.remove(&key).await;
+            db.compare_and_swap("key2", "old", "new".into()).await;
+
+            let counters = db.load_counters();
 
             // Check metrics
-            assert_eq!(store.metrics.total_put_ops(), 1);
-            assert_eq!(store.metrics.total_get_ops(), 2);
-            assert_eq!(store.metrics.total_delete_ops(), 1);
-            assert_eq!(store.metrics.total_cas_failure(), 1);
-            assert_eq!(store.metrics.total_cas_success(), 0);
+            assert_eq!(counters[CountOps::Put], 1);
+            assert_eq!(counters[CountOps::Get], 2);
+            assert_eq!(counters[CountOps::Delete], 1);
+            assert_eq!(counters[CountOps::CasFailure], 1);
+            assert_eq!(counters[CountOps::CasSuccess], 0);
         }
 
         #[tokio::test]
@@ -1310,8 +1350,8 @@ mod routes {
         response::IntoResponse,
     };
     use serde::{Deserialize, Serialize};
-    use std::time::{Duration, Instant};
-    use time::{ext::InstantExt, format_description::well_known::Iso8601, OffsetDateTime};
+    use std::time::Duration;
+    use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
     use crate::utf8_bytes::Utf8Bytes;
 
@@ -1568,24 +1608,25 @@ mod routes {
         (StatusCode::OK, Json(make_status(&db).await))
     }
 
-    #[tracing::instrument(level = "trace", skip(store, metrics))]
-    async fn make_status(Db { store, metrics, .. }: &Db) -> StatusResponse {
-        let total_keys = { store.data.read().await.len() };
+    #[tracing::instrument(level = "trace", skip(db))]
+    async fn make_status(db: &Db) -> StatusResponse {
+        use crate::store_interface::CountOps;
 
-        let get_operations = metrics.total_get_ops();
-        let put_operations = metrics.total_put_ops();
-        let delete_operations = metrics.total_delete_ops();
-        let successful_cas_operations = metrics.total_cas_success();
-        let failed_cas_operations = metrics.total_cas_failure();
+        let total_keys = db.keys_len().await;
+        let counters = db.load_counters();
+
+        let get_operations = counters[CountOps::Get];
+        let put_operations = counters[CountOps::Put];
+        let delete_operations = counters[CountOps::Delete];
+        let successful_cas_operations = counters[CountOps::CasSuccess];
+        let failed_cas_operations = counters[CountOps::CasFailure];
+        // TODO this logic belongs to `Metered`
         let cas_operations = successful_cas_operations + failed_cas_operations;
         let total_operations = get_operations + put_operations + delete_operations + cas_operations;
 
         let version = env!("CARGO_PKG_VERSION").into();
 
-        let uptime = format!(
-            "{:.3}",
-            Instant::now().signed_duration_since(metrics.start_time)
-        );
+        let uptime = format!("{:.3}", db.uptime());
 
         let server_time = OffsetDateTime::now_local()
             .unwrap_or_else(|_| OffsetDateTime::now_utc())
@@ -1622,7 +1663,7 @@ mod routes {
         #[tracing::instrument(level = "trace", skip())]
         async fn setup_app() -> Router {
             let db = Arc::new(Db::new());
-            make_app().with_state(db)
+            make_app(db)
         }
 
         #[tokio::test]
