@@ -193,7 +193,7 @@ mod store_interface {
     };
     use std::{
         collections::HashMap,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{Arc, atomic::{AtomicU64, Ordering}},
         time::{Duration, Instant},
     };
     use tokio::sync::{broadcast, RwLock};
@@ -202,6 +202,38 @@ mod store_interface {
     use tracing::{debug, info};
 
     use crate::utf8_bytes::Utf8Bytes;
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "method")]
+    #[serde(rename_all = "UPPERCASE")]
+    pub enum SimpleRequest {
+        Get {
+            key: String,
+        },
+        Put {
+            key: String,
+            value: Utf8Bytes,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl: Option<u64>,
+        },
+        Delete {
+            key: String,
+        },
+    }
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct SimpleResponse {
+        pub status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub value: Option<Utf8Bytes>,
+    }
+
+    impl SimpleResponse {
+        pub fn new(status: StatusCode, value: Option<Utf8Bytes>) -> Self {
+            Self { status: status.as_u16(), value }
+        }
+    }
+
 
     #[non_exhaustive]
     #[derive(Debug, Copy, Clone)]
@@ -253,7 +285,7 @@ mod store_interface {
 
     #[derive(Debug)]
     pub struct Metered {
-        pub store: KvStore,
+        pub store: Arc<KvStore>,
         pub start_time: Instant,
         pub requests_counters: AppRequestsCounters,
         ops_counters: OpsCounters,
@@ -262,7 +294,7 @@ mod store_interface {
     impl Metered {
         pub fn new() -> Self {
             Self {
-                store: KvStore::new(),
+                store: Arc::new(KvStore::new()),
                 start_time: Instant::now(),
                 ops_counters: OpsCounters::new(),
                 requests_counters: AppRequestsCounters::new(),
@@ -354,6 +386,14 @@ mod store_interface {
         {
             self.ops_counters.increment(CountOps::WatchMultipleKeys);
             self.store.watch_keys(keys).await
+        }
+
+        pub async fn batch_process(
+            self: std::sync::Arc<Self>,
+            requests: Vec<SimpleRequest>
+        ) -> Vec<SimpleResponse> {
+            self.ops_counters.increment(CountOps::Batch);
+            self.store.clone().batch_process(requests).await
         }
     }
 
@@ -642,6 +682,39 @@ mod store_interface {
                 .map(|(rx, init)| tokio_stream::once(Ok(init)).chain(BroadcastStream::new(rx)));
 
             keys.into_iter().zip(streams).collect::<StreamMap<_, _>>()
+        }
+
+        pub async fn batch_process(
+            self: Arc<Self>,
+            requests: Vec<SimpleRequest>
+        ) -> Vec<SimpleResponse> {
+            let db = self.clone();
+            let handles = requests.into_iter().map(|request| {
+                let db = db.clone();
+                match request {
+                    SimpleRequest::Get { key } => {
+                        tokio::task::spawn(async move { db.get(&key).await.into_status_body() })
+                    }
+                    SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
+                        let ttl = ttl.map(Duration::from_secs);
+                        db.insert(key, value, ttl).await.into_status_body()
+                    }),
+                    SimpleRequest::Delete { key } => {
+                        tokio::task::spawn(async move { db.remove(&key).await.into_status_body() })
+                    }
+                }
+            });
+
+            let mut responses = vec![];
+
+            for handle in handles {
+                let (status, value) = handle
+                    .await
+                    .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, None));
+                responses.push(SimpleResponse::new(status, value));
+            }
+
+            responses
         }
 
         #[tracing::instrument(level = "trace", skip(self))]
@@ -1431,7 +1504,11 @@ mod routes {
     use std::time::Duration;
     use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
-    use crate::utf8_bytes::Utf8Bytes;
+    use crate::{
+        utf8_bytes::Utf8Bytes,
+        store_interface::SimpleRequest,
+        store_interface::SimpleResponse
+    };
 
     #[derive(Debug, Default, Deserialize)]
     pub struct CasPayload {
@@ -1460,31 +1537,6 @@ mod routes {
         batch_requests_count: usize,
         server_time: String,
         version: String,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(tag = "method")]
-    #[serde(rename_all = "UPPERCASE")]
-    pub enum SimpleRequest {
-        Get {
-            key: String,
-        },
-        Put {
-            key: String,
-            value: Utf8Bytes,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            ttl: Option<u64>,
-        },
-        Delete {
-            key: String,
-        },
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    struct SimpleResponse {
-        status: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        value: Option<Utf8Bytes>,
     }
 
     #[tracing::instrument(level = "trace", skip(db))]
@@ -1581,6 +1633,7 @@ mod routes {
         Ok(Sse::new(response_stream).keep_alive(KeepAlive::default()))
     }
 
+    // TODO refactor to count number of requests in Metered
     #[tracing::instrument(level = "trace", skip(db, requests))]
     pub async fn batch_process(
         State(db): State<Arc<Db>>,
@@ -1590,33 +1643,32 @@ mod routes {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
 
-        let handles = requests.into_iter().map(|request| {
-            let db = db.clone();
-            match request {
-                SimpleRequest::Get { key } => {
-                    tokio::task::spawn(async move { db.get(&key).await.into_status_body() })
-                }
-                SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
-                    let ttl = ttl.map(Duration::from_secs);
-                    db.insert(key, value, ttl).await.into_status_body()
-                }),
-                SimpleRequest::Delete { key } => {
-                    tokio::task::spawn(async move { db.remove(&key).await.into_status_body() })
-                }
-            }
-        });
+        // let handles = requests.into_iter().map(|request| {
+        //     let db = db.clone();
+        //     match request {
+        //         SimpleRequest::Get { key } => {
+        //             tokio::task::spawn(async move { db.get(&key).await.into_status_body() })
+        //         }
+        //         SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
+        //             let ttl = ttl.map(Duration::from_secs);
+        //             db.insert(key, value, ttl).await.into_status_body()
+        //         }),
+        //         SimpleRequest::Delete { key } => {
+        //             tokio::task::spawn(async move { db.remove(&key).await.into_status_body() })
+        //         }
+        //     }
+        // });
+        //
+        // let mut responses = vec![];
+        //
+        // for handle in handles {
+        //     let (status, value) = handle
+        //         .await
+        //         .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, None));
+        //     responses.push(SimpleResponse::new(status, value));
+        // }
 
-        let mut responses = vec![];
-
-        for handle in handles {
-            let (status, value) = handle
-                .await
-                .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, None));
-            responses.push(SimpleResponse {
-                status: status.as_u16(),
-                value,
-            });
-        }
+        let responses = db.batch_process(requests).await;
 
         Ok(Json(responses))
     }
