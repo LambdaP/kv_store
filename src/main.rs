@@ -193,7 +193,10 @@ mod store_interface {
     };
     use std::{
         collections::HashMap,
-        sync::{Arc, atomic::{AtomicU64, Ordering}},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::{Duration, Instant},
     };
     use tokio::sync::{broadcast, RwLock};
@@ -230,10 +233,12 @@ mod store_interface {
 
     impl SimpleResponse {
         pub fn new(status: StatusCode, value: Option<Utf8Bytes>) -> Self {
-            Self { status: status.as_u16(), value }
+            Self {
+                status: status.as_u16(),
+                value,
+            }
         }
     }
-
 
     #[non_exhaustive]
     #[derive(Debug, Copy, Clone)]
@@ -261,7 +266,14 @@ mod store_interface {
 
     impl std::fmt::Display for Cmd {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(f, "{}", format!("{self:?}").to_uppercase())
+            match self {
+                Cmd::Get(_) => write!(f, "GET"),
+                Cmd::Put(_) => write!(f, "PUT"),
+                Cmd::Delete(_) => write!(f, "DELETE"),
+                Cmd::CompareAndSwap(_) => write!(f, "COMPARE_AND_SWAP"),
+                Cmd::Expired(_) => write!(f, "EXPIRED"),
+                Cmd::Watch => write!(f, "WATCH"),
+            }
         }
     }
 
@@ -390,7 +402,7 @@ mod store_interface {
 
         pub async fn batch_process(
             self: std::sync::Arc<Self>,
-            requests: Vec<SimpleRequest>
+            requests: Vec<SimpleRequest>,
         ) -> Vec<SimpleResponse> {
             self.ops_counters.increment(CountOps::Batch);
             self.store.clone().batch_process(requests).await
@@ -686,7 +698,7 @@ mod store_interface {
 
         pub async fn batch_process(
             self: Arc<Self>,
-            requests: Vec<SimpleRequest>
+            requests: Vec<SimpleRequest>,
         ) -> Vec<SimpleResponse> {
             let db = self.clone();
             let handles = requests.into_iter().map(|request| {
@@ -1504,11 +1516,7 @@ mod routes {
     use std::time::Duration;
     use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
-    use crate::{
-        utf8_bytes::Utf8Bytes,
-        store_interface::SimpleRequest,
-        store_interface::SimpleResponse
-    };
+    use crate::{store_interface::SimpleRequest, utf8_bytes::Utf8Bytes};
 
     #[derive(Debug, Default, Deserialize)]
     pub struct CasPayload {
@@ -1633,7 +1641,6 @@ mod routes {
         Ok(Sse::new(response_stream).keep_alive(KeepAlive::default()))
     }
 
-    // TODO refactor to count number of requests in Metered
     #[tracing::instrument(level = "trace", skip(db, requests))]
     pub async fn batch_process(
         State(db): State<Arc<Db>>,
@@ -1642,31 +1649,6 @@ mod routes {
         if requests.len() > MAX_BATCH_SIZE {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-
-        // let handles = requests.into_iter().map(|request| {
-        //     let db = db.clone();
-        //     match request {
-        //         SimpleRequest::Get { key } => {
-        //             tokio::task::spawn(async move { db.get(&key).await.into_status_body() })
-        //         }
-        //         SimpleRequest::Put { key, value, ttl } => tokio::task::spawn(async move {
-        //             let ttl = ttl.map(Duration::from_secs);
-        //             db.insert(key, value, ttl).await.into_status_body()
-        //         }),
-        //         SimpleRequest::Delete { key } => {
-        //             tokio::task::spawn(async move { db.remove(&key).await.into_status_body() })
-        //         }
-        //     }
-        // });
-        //
-        // let mut responses = vec![];
-        //
-        // for handle in handles {
-        //     let (status, value) = handle
-        //         .await
-        //         .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, None));
-        //     responses.push(SimpleResponse::new(status, value));
-        // }
 
         let responses = db.batch_process(requests).await;
 
@@ -1727,6 +1709,7 @@ mod routes {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::store_interface::SimpleResponse;
         use axum::{
             body::Body,
             http::{Request, StatusCode},
