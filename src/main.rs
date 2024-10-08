@@ -206,6 +206,7 @@ mod store_interface {
     use tower_http::metrics::in_flight_requests::InFlightRequestsCounter;
     use tracing::{debug, info};
 
+    use crate::inner_map::CasError;
     use crate::utf8_bytes::Utf8Bytes;
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -412,7 +413,6 @@ mod store_interface {
     }
 
     // TODO use a BTreeMap to store keys ordered by expiry date
-    // TODO make sure I don't have deadlocks with the two locked structures
     #[derive(Debug)]
     pub struct KvStore {
         pub data: RwLock<inner_map::InnerMap<String, Utf8Bytes>>,
@@ -568,9 +568,6 @@ mod store_interface {
             //   acquire the lock with `read()`
             //   and update the entry using inner mutability.
             if let Some(cnt) = self.data.read().await.try_swap(&key, value.clone(), ttl) {
-                // TODO this reports a change
-                //   even if the new value is the same as before.
-                // Fix this.
                 if let Some(tx) = pub_tx {
                     _ = tx.send((Cmd::Put(cnt), value));
                 }
@@ -650,14 +647,8 @@ mod store_interface {
                     }
                     KvStoreResponse::Success
                 }
-                Err(key_was_there) => {
-                    if key_was_there {
-                        // TODO should I notify subscribers here as well?
-                        KvStoreResponse::CasTestFailed
-                    } else {
-                        KvStoreResponse::NotFound
-                    }
-                }
+                Err(CasError::ValuesDiffered) => KvStoreResponse::CasTestFailed,
+                Err(CasError::NotFound) => KvStoreResponse::NotFound,
             }
         }
 
@@ -1032,22 +1023,26 @@ mod inner_map {
     }
 
     impl<V> StoreEntry<V> {
-        #[tracing::instrument(level = "trace", skip(value, ttl))]
         fn new(value: V, ttl: Option<Duration>) -> Self {
             let expires = ttl.and_then(|dur| Instant::now().checked_add(dur));
             StoreEntry { value, expires }
         }
 
-        #[tracing::instrument(level = "trace", skip(self, new))]
         fn update_value(&mut self, new: V) {
             self.value = new;
         }
     }
 
     #[derive(Debug, Default)]
-    pub struct InnerMap<K, V> {
+    pub(crate) struct InnerMap<K, V> {
         data: HashMap<K, Mutex<StoreEntry<V>>>,
         mut_count: AtomicU64,
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub(crate) enum CasError {
+        NotFound,
+        ValuesDiffered,
     }
 
     impl<K, V> InnerMap<K, V>
@@ -1081,12 +1076,7 @@ mod inner_map {
             }
         }
 
-        // TODO this shouldn't count as a change
-        //   if the value hasn't actually changed.
-        // This also raises the question of changes wrt the TTL.
-        // If I'm inserting the same value with a different TTL,
-        //   which takes priority?
-        // A sane default would be whichever ends last, maybe
+        #[tracing::instrument(level = "trace", skip(self, key, value, ttl))]
         pub fn try_swap<Q>(&self, key: &Q, value: V, ttl: Option<Duration>) -> Option<u64>
         where
             K: Borrow<Q>,
@@ -1125,21 +1115,20 @@ mod inner_map {
         }
 
         // TODO ttl?
-        // TODO replace bool with enum to clarify API
         #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-        pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Result<u64, bool>
+        pub fn compare_and_swap<Q, E>(&self, key: &Q, expected: &E, new: V) -> Result<u64, CasError>
         where
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
             E: ?Sized,
             V: PartialEq<E>,
         {
-            let locked_entry = self.data.get(key).ok_or(false)?;
+            let locked_entry = self.data.get(key).ok_or(CasError::NotFound)?;
 
             let mut guard = locked_entry.lock().unwrap();
 
             if guard.value != *expected {
-                return Err(true);
+                return Err(CasError::ValuesDiffered);
             }
 
             guard.update_value(new);
@@ -1238,7 +1227,7 @@ mod inner_map {
 
             assert_eq!(
                 map.compare_and_swap("key5", "wrong_value", "new_value".into()),
-                Err(true)
+                Err(CasError::ValuesDiffered)
             );
 
             let entry = map.get("key5").unwrap();
@@ -1268,7 +1257,7 @@ mod inner_map {
             assert!(map.remove("non_existent").is_none());
             assert_eq!(
                 map.compare_and_swap("non_existent", "any", "new".into()),
-                Err(false)
+                Err(CasError::NotFound)
             );
         }
 
