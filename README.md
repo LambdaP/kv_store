@@ -18,7 +18,7 @@ This project implements a in-memory key-value store with the following character
 
 ### Data Structure
 
-- `LockMap`: Custom concurrent map implementation using `RwLock` for write operations and inner mutability for read operations
+- `LockMap`: Custom concurrent map implementation using `tokio::sync::RwLock` for write operations and inner mutability (using `std::sync::Mutex`) for read operations
 - `Utf8Bytes`: Wrapper around `bytes::Bytes` ensuring UTF-8 validity
 
 ### API Endpoints
@@ -37,11 +37,6 @@ This project implements a in-memory key-value store with the following character
 - Read operations use `RwLock::read()` with inner mutability for updates
 - Write operations use `RwLock::write()` for exclusive access
 - Compare-and-swap uses optimistic locking with `RwLock::read()`
-
-### Error Handling
-
-- Custom error types for operation-specific failures (e.g., `CasError`)
-- Use of `Result` for propagating errors
 
 ### Testing
 
