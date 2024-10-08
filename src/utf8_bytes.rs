@@ -1,6 +1,6 @@
+use std::{ops::Deref, str::Utf8Error};
+
 use bytes::Bytes;
-use std::ops::Deref;
-use std::str::Utf8Error;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Utf8Bytes(Bytes);
