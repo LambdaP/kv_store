@@ -9,9 +9,8 @@ use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
 use crate::{
-    store_interface::{Metered, SimpleRequest},
+    store::{Metered, SimpleRequest},
     utf8_bytes::Utf8Bytes,
-    make_app
 };
 
 type Db = Metered;
@@ -160,7 +159,7 @@ pub async fn status(State(db): State<Arc<Db>>) -> impl IntoResponse {
 
 #[tracing::instrument(level = "trace", skip(db))]
 async fn make_status(db: &Db) -> StatusResponse {
-    use crate::store_interface::CountOps;
+    use crate::store::CountOps;
 
     let total_keys = db.keys_len().await;
     let counters = db.get_ops_counters();
@@ -207,7 +206,10 @@ async fn make_status(db: &Db) -> StatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_interface::SimpleResponse;
+    use crate::{
+        make_app,
+        store::SimpleResponse
+    };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
