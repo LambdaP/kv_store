@@ -5,25 +5,15 @@ use std::{
     sync::Arc,
 };
 
-use axum::{
-    handler::Handler,
-    routing::{delete, get, post, put},
-    Router,
-};
 use tokio::{
     signal,
     sync::oneshot,
-    time::{interval, timeout, Duration, MissedTickBehavior},
+    time::{timeout, Duration},
 };
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
-use tower_http::metrics::InFlightRequestsLayer;
 use tracing::{error, info, warn};
 
-use crate::store::Metered;
-
-mod routes;
-mod store;
-mod utf8_bytes;
+use kv_store::{routes, Metered};
 
 type Db = Metered;
 
@@ -43,20 +33,13 @@ async fn main() {
 
     let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
 
+    let cleanup_db = db.clone();
     let cleanup_task = tokio::spawn({
-        let cleanup_store = db.clone();
-        let interval_cleanup = async move {
-            let mut interval = interval(Duration::from_millis(10));
-            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                cleanup_store.store.cleanup_marked_keys().await;
-            }
-        };
+        let cleanup_loop = cleanup_db.cleanup_loop();
 
         async move {
             tokio::select! {
-                () = interval_cleanup => {},
+                () = cleanup_loop => {},
                 _ = &mut cleanup_shutdown_rx => {
                 info!("Cleanup task received shutdown signal");
                 },
@@ -68,7 +51,7 @@ async fn main() {
 
     let server = axum::serve(
         listener,
-        make_app(db.clone())
+        routes::make_app(db.clone())
             .layer(GovernorLayer {
                 config: Arc::new(GovernorConfig::default()),
             })
@@ -82,7 +65,7 @@ async fn main() {
 
     let server_task = tokio::spawn(server.into_future());
 
-    () = shutdown_signal().await;
+    let () = shutdown_signal().await;
 
     info!("Initiating server shutdown");
 
@@ -138,37 +121,6 @@ fn get_port_from_env() -> Option<u16> {
             info!("Successfully read KV_STORE_PORT from environment: {}", port);
         })
             .ok()
-}
-
-fn make_app(db: Arc<Db>) -> Router {
-    let requests_counters = &db.requests_counters;
-
-    Router::new()
-        .route("/store/:key", get(routes::get_key))
-        .route("/store/:key", put(routes::put_key_val))
-        .route("/store/:key", delete(routes::delete_key))
-        .route("/store/cas/:key", post(routes::compare_and_swap))
-        .route(
-            "/watch_key/:key",
-            get(routes::watch_key
-                .layer(InFlightRequestsLayer::new(requests_counters.watch.clone()))),
-        )
-        .route(
-            "/watch",
-            post(
-                routes::watch_multiple_keys
-                    .layer(InFlightRequestsLayer::new(requests_counters.watch.clone())),
-            ),
-        )
-        .route(
-            "/batch",
-            post(
-                routes::batch_process
-                    .layer(InFlightRequestsLayer::new(requests_counters.batch.clone())),
-            ),
-        )
-        .route("/status", get(routes::status))
-        .with_state(db)
 }
 
 async fn shutdown_signal() {

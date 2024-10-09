@@ -1,17 +1,20 @@
 use std::{env, sync::Arc, time::Duration};
 
-use axum::{
-    extract::{Json, Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-};
-use serde::{Deserialize, Serialize};
-use time::{format_description::well_known::Iso8601, OffsetDateTime};
-
 use crate::{
     store::{Metered, SimpleRequest},
     utf8_bytes::Utf8Bytes,
 };
+use axum::{
+    extract::{Json, Path, Query, State},
+    handler::Handler,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post, put},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use time::{format_description::well_known::Iso8601, OffsetDateTime};
+use tower_http::metrics::InFlightRequestsLayer;
 
 type Db = Metered;
 
@@ -48,6 +51,33 @@ pub struct StatusResponse {
     batch_requests_count: usize,
     server_time: String,
     version: String,
+}
+
+pub fn make_app(db: Arc<Db>) -> Router {
+    let requests_counters = &db.requests_counters;
+
+    Router::new()
+        .route("/store/:key", get(get_key))
+        .route("/store/:key", put(put_key_val))
+        .route("/store/:key", delete(delete_key))
+        .route("/store/cas/:key", post(compare_and_swap))
+        .route(
+            "/watch_key/:key",
+            get(watch_key.layer(InFlightRequestsLayer::new(requests_counters.watch.clone()))),
+        )
+        .route(
+            "/watch",
+            post(
+                watch_multiple_keys
+                    .layer(InFlightRequestsLayer::new(requests_counters.watch.clone())),
+            ),
+        )
+        .route(
+            "/batch",
+            post(batch_process.layer(InFlightRequestsLayer::new(requests_counters.batch.clone()))),
+        )
+        .route("/status", get(status))
+        .with_state(db)
 }
 
 #[tracing::instrument(level = "trace", skip(db))]
@@ -206,7 +236,7 @@ async fn make_status(db: &Db) -> StatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{make_app, store::SimpleResponse};
+    use crate::store::SimpleResponse;
     use axum::{
         body::Body,
         http::{Request, StatusCode},

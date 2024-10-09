@@ -107,11 +107,18 @@ impl AppRequestsCounters {
 pub struct Metered {
     pub store: Arc<KvStore>,
     pub start_time: Instant,
-    pub requests_counters: AppRequestsCounters,
+    pub(crate) requests_counters: AppRequestsCounters,
     ops_counters: OpsCounters,
 }
 
+impl Default for Metered {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metered {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             store: Arc::new(KvStore::new()),
@@ -169,7 +176,7 @@ impl Metered {
         response
     }
 
-    pub async fn compare_and_swap<E>(
+    pub(crate) async fn compare_and_swap<E>(
         &self,
         key: &str,
         expected: &E,
@@ -190,7 +197,7 @@ impl Metered {
         response
     }
 
-    pub async fn watch_key(
+    pub(crate) async fn watch_key(
         &self,
         key: String,
     ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
@@ -199,7 +206,7 @@ impl Metered {
         self.store.watch_keys(vec![key]).await
     }
 
-    pub async fn watch_multiple_keys(
+    pub(crate) async fn watch_multiple_keys(
         &self,
         keys: Vec<String>,
     ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
@@ -209,11 +216,22 @@ impl Metered {
     }
 
     pub async fn batch_process(
-        self: std::sync::Arc<Self>,
+        self: Arc<Self>,
         requests: Vec<SimpleRequest>,
     ) -> Vec<SimpleResponse> {
         self.ops_counters.increment(CountOps::Batch);
         self.store.clone().batch_process(requests).await
+    }
+
+    pub async fn cleanup_loop(self: Arc<Self>) {
+        use tokio::time::{interval, MissedTickBehavior};
+
+        let mut interval = interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.store.cleanup_marked_keys().await;
+        }
     }
 }
 
@@ -571,18 +589,17 @@ impl KvStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Db;
     use std::sync::Arc;
     use std::time::Duration;
 
     #[tracing::instrument(level = "trace", skip())]
-    async fn setup_kvstore() -> KvStore {
+    async fn setup_kv_store() -> KvStore {
         KvStore::new()
     }
 
     #[tokio::test]
     async fn test_insert_and_get() {
-        let store = Db::new();
+        let store = Metered::new();
         let key = "test_key";
         let value = "test_value";
 
@@ -595,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_with_ttl() {
-        let store = setup_kvstore().await;
+        let store = setup_kv_store().await;
         let key = "ttl_key";
         let value = "ttl_value";
 
@@ -617,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove() {
-        let store = setup_kvstore().await;
+        let store = setup_kv_store().await;
         let key = "remove_key";
         let value = "remove_value";
 
@@ -632,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compare_and_swap() {
-        let store = setup_kvstore().await;
+        let store = setup_kv_store().await;
         let key = "cas_key";
         let initial_value = "initial_value";
         let new_value = "new_value";
@@ -658,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics() {
-        let db = Db::new();
+        let db = Metered::new();
         let key = "metrics_key";
         let value = "metrics_value";
 
@@ -678,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_accuracy() {
-        let db = Db::new();
+        let db = Metered::new();
         let key = "key1";
 
         // Perform a series of operations
@@ -700,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_marked_keys() {
-        let db = Db::new();
+        let db = Metered::new();
         let key = "cleanup_key";
         let value = "cleanup_value";
 
@@ -724,7 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_access() {
-        let db = Arc::new(Db::new());
+        let db = Arc::new(Metered::new());
         let key = Arc::new("concurrent_key".to_string());
         let mut handles = vec![];
 
@@ -765,9 +782,7 @@ mod tests {
             assert!(matches!(result, KvStoreResponse::SuccessBody(_)));
         }
 
-        _ = db
-            .insert(key.to_string(), format!("value_0").into(), None)
-            .await;
+        _ = db.insert(key.to_string(), "value_0".into(), None).await;
 
         // Test concurrent CAS operations
         let mut cas_handles = vec![];
