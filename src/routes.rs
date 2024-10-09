@@ -206,10 +206,7 @@ async fn make_status(db: &Db) -> StatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        make_app,
-        store::SimpleResponse
-    };
+    use crate::{make_app, store::SimpleResponse};
     use axum::{
         body::Body,
         http::{Request, StatusCode},

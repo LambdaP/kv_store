@@ -21,8 +21,8 @@ use tracing::{error, info, warn};
 
 use crate::store::Metered;
 
-mod store;
 mod routes;
+mod store;
 mod utf8_bytes;
 
 type Db = Metered;
@@ -188,4 +188,3 @@ async fn shutdown_signal() {
 
     info!("Shutdown signal received");
 }
-
