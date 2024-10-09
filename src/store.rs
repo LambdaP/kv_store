@@ -106,7 +106,7 @@ impl AppRequestsCounters {
 #[derive(Debug)]
 pub struct Metered {
     pub store: Arc<KvStore>,
-    pub start_time: Instant,
+    start_time: Instant,
     pub(crate) requests_counters: AppRequestsCounters,
     ops_counters: OpsCounters,
 }
@@ -128,28 +128,28 @@ impl Metered {
         }
     }
 
-    pub async fn keys_len(&self) -> usize {
+    pub(crate) async fn keys_len(&self) -> usize {
         self.store.data.read().await.len()
     }
 
-    pub fn uptime(&self) -> time::Duration {
+    pub(crate) fn uptime(&self) -> time::Duration {
         use time::ext::InstantExt;
         Instant::now().signed_duration_since(self.start_time)
     }
 
-    pub fn get_ops_counters(&self) -> OpsMap<u64> {
+    pub(crate) fn get_ops_counters(&self) -> OpsMap<u64> {
         self.ops_counters.load_all()
     }
 
-    pub fn get_watch_requests_count(&self) -> usize {
+    pub(crate) fn get_watch_requests_count(&self) -> usize {
         self.requests_counters.watch.get()
     }
 
-    pub fn get_batch_requests_count(&self) -> usize {
+    pub(crate) fn get_batch_requests_count(&self) -> usize {
         self.requests_counters.batch.get()
     }
 
-    pub async fn insert(
+    pub(crate) async fn insert(
         &self,
         key: String,
         value: Utf8Bytes,
@@ -160,13 +160,13 @@ impl Metered {
         response
     }
 
-    pub async fn get(&self, key: &str) -> KvStoreResponse {
+    pub(crate) async fn get(&self, key: &str) -> KvStoreResponse {
         let response = self.store.get(key).await;
         self.ops_counters.increment(CountOps::Get);
         response
     }
 
-    pub async fn remove(&self, key: &str) -> KvStoreResponse {
+    pub(crate) async fn remove(&self, key: &str) -> KvStoreResponse {
         let response = self.store.remove(key).await;
 
         if let KvStoreResponse::Success = response {
@@ -215,7 +215,7 @@ impl Metered {
         self.store.watch_keys(keys).await
     }
 
-    pub async fn batch_process(
+    pub(crate) async fn batch_process(
         self: Arc<Self>,
         requests: Vec<SimpleRequest>,
     ) -> Vec<SimpleResponse> {
