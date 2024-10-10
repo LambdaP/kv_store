@@ -1,14 +1,19 @@
-# Concurrent Key-Value Store with Axum
+# Concurrent HTTP Key-Value Store
 
-A concurrent key-value store implemented in Rust using the Axum web framework.
+A concurrent key-value store
+  with an HTTP API.
+Implemented in Rust
+  with the Tokio asynchronous runtime
+  and the Axum web framework.
+
+Copyright 2024 Patrick Lambein
 
 ## Implementation Overview
 
 This project implements a in-memory key-value store with the following characteristics:
 
 - Concurrent access using Tokio's asynchronous runtime
-- RESTful API built with Axum
-- Lock-free reads for improved concurrency
+- HTTP-based RESTful API built with Axum
 - Compare-and-swap (CAS) operations for atomic updates
 - Time-to-live (TTL) support for key expiration
 - Server-Sent Events (SSE) for key change notifications
