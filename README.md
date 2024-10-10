@@ -96,3 +96,7 @@ curl -X POST http://localhost:3000/watch -H "Content-Type: application/json" -d 
 - `bytes`: Efficient byte buffer management
 
 This project serves as a practical exploration of concurrent data structure design and RESTful API implementation in Rust.
+
+## License
+
+See the [LICENSE.md](LICENSE.md) file for license rights and limitations (AGPLv3)
