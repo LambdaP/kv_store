@@ -7,9 +7,9 @@ use std::{
 
 use tokio::{
     signal,
-    sync::oneshot,
     time::{timeout, Duration},
 };
+use tokio_util::sync::CancellationToken;
 use tower_governor::{governor::GovernorConfig, GovernorLayer};
 use tracing::{error, info, warn};
 
@@ -31,23 +31,20 @@ async fn main() {
 
     let db = Arc::new(Db::new());
 
-    let (cleanup_shutdown_tx, mut cleanup_shutdown_rx) = oneshot::channel();
+    let cancel_token = CancellationToken::new();
 
     let cleanup_db = db.clone();
     let cleanup_task = tokio::spawn({
-        let cleanup_loop = cleanup_db.cleanup_loop();
+        let cleanup_loop = cleanup_db.keys_cleanup_loop();
+        let cleanup_token = cancel_token.child_token();
 
         async move {
-            tokio::select! {
-                () = cleanup_loop => {},
-                _ = &mut cleanup_shutdown_rx => {
-                info!("Cleanup task received shutdown signal");
-                },
-            }
+            cleanup_token.run_until_cancelled(cleanup_loop).await;
+            info!("Cleanup task was cancelled");
         }
     });
 
-    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server_token = cancel_token.child_token();
 
     let server = axum::serve(
         listener,
@@ -59,9 +56,7 @@ async fn main() {
             //   for the Governor layer to work properly.
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        _ = server_shutdown_rx.await;
-    });
+    .with_graceful_shutdown(server_token.cancelled_owned());
 
     let server_task = tokio::spawn(server.into_future());
 
@@ -69,13 +64,15 @@ async fn main() {
 
     info!("Initiating server shutdown");
 
-    tokio::spawn(async {
-        _ = server_shutdown_tx.send(());
+    cancel_token.cancel();
+
+    let server_shutdown = tokio::spawn(async {
         match timeout(Duration::from_secs(30), server_task).await {
-            Ok(res) => {
-                if let Err(e) = res {
-                    error!("Server error: {}", e);
-                }
+            Ok(Err(e)) => {
+                error!("Server error: {}", e);
+            }
+            Ok(_) => {
+                info!("Server task shut down normally");
             }
             _ => {
                 warn!("Server shutdown timed out after 30 seconds");
@@ -83,13 +80,13 @@ async fn main() {
         }
     });
 
-    tokio::spawn(async {
-        _ = cleanup_shutdown_tx.send(());
+    let cleanup_shutdown = tokio::spawn(async {
         match timeout(Duration::from_secs(10), cleanup_task).await {
-            Ok(res) => {
-                if let Err(e) = res {
-                    error!("Cleanup task error: {}", e);
-                }
+            Ok(Err(e)) => {
+                error!("Cleanup task error: {}", e);
+            }
+            Ok(_) => {
+                info!("Cleanup task shut down normally");
             }
             _ => {
                 warn!("Cleanup task shutdown timed out after 10 seconds");
@@ -97,7 +94,7 @@ async fn main() {
         }
     });
 
-    db.store.close_publish_handles().await;
+    _ = tokio::join!(server_shutdown, cleanup_shutdown, db.cleanup_shutdown());
 
     info!("Server shutdown complete");
 }

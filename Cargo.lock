@@ -499,6 +499,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower 0.5.1",
  "tower-http",
  "tower_governor",
@@ -1121,6 +1122,7 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

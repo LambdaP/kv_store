@@ -223,7 +223,7 @@ impl Metered {
         self.store.clone().batch_process(requests).await
     }
 
-    pub async fn cleanup_loop(self: Arc<Self>) {
+    pub async fn keys_cleanup_loop(self: Arc<Self>) {
         use tokio::time::{interval, MissedTickBehavior};
 
         let mut interval = interval(Duration::from_millis(10));
@@ -232,6 +232,10 @@ impl Metered {
             interval.tick().await;
             self.store.cleanup_marked_keys().await;
         }
+    }
+
+    pub async fn cleanup_shutdown(&self) {
+        self.store.cleanup_shutdown().await;
     }
 }
 
@@ -334,7 +338,7 @@ pub struct KvStore {
 
 impl KvStore {
     #[tracing::instrument(level = "trace", skip())]
-    pub fn new() -> KvStore {
+    fn new() -> KvStore {
         KvStore {
             data: RwLock::default(),
             publish_handles: RwLock::default(),
@@ -342,11 +346,11 @@ impl KvStore {
         }
     }
 
-    pub(crate) async fn get_pub_tx(&self, key: &str) -> Option<PubHandle> {
+    async fn get_pub_tx(&self, key: &str) -> Option<PubHandle> {
         self.publish_handles.read().await.get(key).cloned()
     }
 
-    pub(crate) async fn create_pub_tx(&self, key: String) -> PubHandle {
+    async fn create_pub_tx(&self, key: String) -> PubHandle {
         self.publish_handles
             .write()
             .await
@@ -364,7 +368,7 @@ impl KvStore {
     //   could similarly lead to readers starving writers
     //   on individual keys.
     #[tracing::instrument(level = "trace", skip(self, value))]
-    pub async fn insert(
+    async fn insert(
         &self,
         key: String,
         value: Utf8Bytes,
@@ -399,7 +403,7 @@ impl KvStore {
 
     // TODO communicate TTL so that it can be part of the response
     #[tracing::instrument(level = "trace", skip(self, key))]
-    pub async fn get(&self, key: &str) -> KvStoreResponse {
+    async fn get(&self, key: &str) -> KvStoreResponse {
         debug!("Getting key: {}", key);
 
         let Some(inner_map::StoreEntry { value, expires }) = self.data.read().await.get(key) else {
@@ -417,7 +421,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key))]
-    pub async fn remove(&self, key: &str) -> KvStoreResponse {
+    async fn remove(&self, key: &str) -> KvStoreResponse {
         debug!("Removing key: {}", key);
 
         let Some(cnt) = self.data.write().await.remove(key) else {
@@ -432,7 +436,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, key, expected, new))]
-    pub async fn compare_and_swap<E>(
+    async fn compare_and_swap<E>(
         &self,
         key: &str,
         expected: &E,
@@ -461,7 +465,7 @@ impl KvStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, keys))]
-    pub async fn watch_keys(
+    async fn watch_keys(
         &self,
         keys: Vec<String>,
     ) -> impl tokio_stream::Stream<Item = (String, Result<(Cmd, Utf8Bytes), BroadcastStreamRecvError>)>
@@ -497,7 +501,7 @@ impl KvStore {
         keys.into_iter().zip(streams).collect::<StreamMap<_, _>>()
     }
 
-    pub async fn batch_process(
+    async fn batch_process(
         self: Arc<Self>,
         requests: Vec<SimpleRequest>,
     ) -> Vec<SimpleResponse> {
@@ -545,7 +549,7 @@ impl KvStore {
         std::mem::take(&mut *guard)
     }
 
-    pub async fn cleanup_marked_keys(&self) {
+    async fn cleanup_marked_keys(&self) {
         let keys = self.take_keys_to_remove();
 
         if keys.is_empty() {
@@ -579,7 +583,11 @@ impl KvStore {
         }
     }
 
-    pub async fn close_publish_handles(&self) {
+    async fn cleanup_shutdown(&self) {
+        self.close_publish_handles().await;
+    }
+
+    async fn close_publish_handles(&self) {
         // TODO maybe send a termination message
         let mut guard = self.publish_handles.write().await;
         _ = std::mem::take(&mut *guard);
